@@ -1,9 +1,10 @@
 name: Publish
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  # crates.io Trusted Publishing rejects the `workflow_run` trigger, so we
+  # cannot gate this workflow on CI completion. Use branch protection on
+  # `main` to ensure CI passes before a commit reaches this trigger.
+  push:
     branches: [main]
 
 permissions:
@@ -15,7 +16,6 @@ concurrency:
 
 jobs:
   publish:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -25,7 +25,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
       - run: make publish
