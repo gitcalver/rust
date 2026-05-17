@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # push covers every branch (including main); pull_request covers fork PRs.
+  # Same-repo PRs trigger both events; concurrency keys on event_name so they
+  # don't cancel each other—accepted in exchange for branch-level coverage
+  # without requiring an open PR.
   push:
-    branches: [main]
   pull_request:
 
 permissions:
