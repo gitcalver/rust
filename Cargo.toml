@@ -6,6 +6,9 @@ name = "gitcalver"
 edition = "2024"
 license = "MIT"
 description = "Deterministic version numbers from git history"
+documentation = "https://docs.rs/gitcalver"
+homepage = "https://gitcalver.org"
+repository = "https://github.com/gitcalver/rust"
 
 [dependencies]
 gix = { version = "0.81", default-features = false, features = ["status", "revision", "sha1"] }
