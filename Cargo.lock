@@ -244,20 +244,12 @@ dependencies = [
 
 [[package]]
 name = "gitcalver"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "gix",
  "tempfile",
  "thiserror",
  "time",
-]
-
-[[package]]
-name = "gitcalver-cli"
-version = "0.1.0"
-dependencies = [
- "gitcalver",
- "tempfile",
 ]
 
 [[package]]
