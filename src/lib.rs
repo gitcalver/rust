@@ -1,5 +1,5 @@
-use gix::prelude::ObjectIdExt;
 use gix::ObjectId;
+use gix::prelude::ObjectIdExt;
 use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
@@ -150,7 +150,12 @@ fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> 
     ))
 }
 
-fn reverse(repo: &gix::Repository, opts: &Options<'_>, date_str: &str, n: usize) -> Result<String, Error> {
+fn reverse(
+    repo: &gix::Repository,
+    opts: &Options<'_>,
+    date_str: &str,
+    n: usize,
+) -> Result<String, Error> {
     let branch = detect_branch(repo, opts.branch)?;
 
     let mut candidates = Vec::new();
@@ -310,9 +315,7 @@ fn branch_relation(
     branch: &BranchInfo,
     is_head: bool,
 ) -> Result<BranchRelation, Error> {
-    if is_head
-        && let Ok(Some(head_ref)) = repo.head_ref()
-    {
+    if is_head && let Ok(Some(head_ref)) = repo.head_ref() {
         let head_name = head_ref.name().to_string();
         if head_name == format!("refs/heads/{}", branch.name) {
             return Ok(BranchRelation::OnBranch);
@@ -327,7 +330,9 @@ fn branch_relation(
     if base == target {
         Ok(BranchRelation::OnBranch)
     } else {
-        Ok(BranchRelation::OffBranch { merge_base: base.into() })
+        Ok(BranchRelation::OffBranch {
+            merge_base: base.into(),
+        })
     }
 }
 
@@ -376,7 +381,12 @@ fn short_hash(repo: &gix::Repository, id: ObjectId) -> String {
 
 fn epoch_to_date(seconds: gix::date::SecondsSinceUnixEpoch) -> Result<String, Error> {
     let dt = OffsetDateTime::from_unix_timestamp(seconds).map_err(git_err)?;
-    Ok(format!("{:04}{:02}{:02}", dt.year(), dt.month() as u8, dt.day()))
+    Ok(format!(
+        "{:04}{:02}{:02}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day()
+    ))
 }
 
 fn git_err(e: impl std::error::Error + Send + Sync + 'static) -> Error {
@@ -514,7 +524,10 @@ mod tests {
 
     #[test]
     fn epoch_to_date_out_of_range() {
-        assert!(matches!(epoch_to_date(i64::MAX).unwrap_err(), Error::Git(_)));
+        assert!(matches!(
+            epoch_to_date(i64::MAX).unwrap_err(),
+            Error::Git(_)
+        ));
     }
 
     #[test]
@@ -553,8 +566,14 @@ mod tests {
 
     #[test]
     fn format_version_clean() {
-        assert_eq!(format_version("", "20260412", 1, false, "", ""), "20260412.1");
-        assert_eq!(format_version("v0.", "20260412", 3, false, "", ""), "v0.20260412.3");
+        assert_eq!(
+            format_version("", "20260412", 1, false, "", ""),
+            "20260412.1"
+        );
+        assert_eq!(
+            format_version("v0.", "20260412", 3, false, "", ""),
+            "v0.20260412.3"
+        );
     }
 
     #[test]
@@ -632,11 +651,10 @@ mod tests {
         commit_at(remote.path(), "2026-04-10T12:00:00Z");
 
         let parent = tempfile::tempdir().unwrap();
-        git_in(parent.path(), &[
-            "clone",
-            remote.path().to_str().unwrap(),
-            "local",
-        ]);
+        git_in(
+            parent.path(),
+            &["clone", remote.path().to_str().unwrap(), "local"],
+        );
         let local = parent.path().join("local");
         commit_at(&local, "2026-04-10T13:00:00Z");
 
@@ -676,8 +694,7 @@ mod tests {
         commit_at(dir.path(), "2026-04-10T12:00:00Z");
         let repo = gix::discover(dir.path()).unwrap();
 
-        let bogus = gix::ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-            .unwrap();
+        let bogus = gix::ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
         let result = short_hash(&repo, bogus);
         assert_eq!(result, "deadbee");
     }
@@ -974,11 +991,14 @@ mod tests {
     fn origin_head_dangling() {
         let dir = new_repo();
         commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/nonexistent",
-        ]);
+        git_in(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/nonexistent",
+            ],
+        );
         let result = run(&Options {
             dir: dir.path(),
             ..Options::default()

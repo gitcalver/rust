@@ -222,7 +222,11 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn commit_at(dir: &std::path::Path, date: &str) {
@@ -237,7 +241,11 @@ mod tests {
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn new_repo() -> tempfile::TempDir {
@@ -328,11 +336,14 @@ mod tests {
     #[test]
     fn parse_all_flags() {
         let parsed = parse_args(&args(&[
-            "--prefix", "v0.",
-            "--dirty", "-dirty",
+            "--prefix",
+            "v0.",
+            "--dirty",
+            "-dirty",
             "--no-dirty",
             "--no-dirty-hash",
-            "--branch", "main",
+            "--branch",
+            "main",
             "--short",
             "abc123",
         ]))

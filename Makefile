@@ -5,7 +5,11 @@ test:
 	cargo test
 
 lint:
-	cargo clippy
+	cargo fmt --check
+	cargo clippy --all-targets
+
+fmt:
+	cargo fmt
 
 acceptance: build
 	GITCALVER=$(CURDIR)/target/release/gitcalver ../sh/test/test.sh
@@ -27,4 +31,4 @@ publish publish-dry-run:
 	CARGO_TARGET_DIR="$$src/target" cargo check --quiet; \
 	CARGO_TARGET_DIR="$$src/target" cargo publish $(if $(findstring dry,$@),--dry-run,)
 
-.PHONY: build test lint acceptance coverage publish publish-dry-run
+.PHONY: build test lint fmt acceptance coverage publish publish-dry-run
