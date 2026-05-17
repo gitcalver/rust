@@ -101,15 +101,11 @@ fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> 
 
     let subject = opts.target.unwrap_or("HEAD");
     let branch = detect_branch(repo, opts.branch)?;
-    let relation = branch_relation(repo, target_id, &branch, is_head).map_err(|e| {
-        if let Error::Git(source) = e {
-            Error::NotTraceable {
-                subject: subject.to_owned(),
-                branch: branch.name.clone(),
-                source,
-            }
-        } else {
-            e
+    let relation = branch_relation(repo, target_id, &branch, is_head).map_err(|source| {
+        Error::NotTraceable {
+            subject: subject.to_owned(),
+            branch: branch.name.clone(),
+            source,
         }
     })?;
 
@@ -314,7 +310,7 @@ fn branch_relation(
     target: ObjectId,
     branch: &BranchInfo,
     is_head: bool,
-) -> Result<BranchRelation, Error> {
+) -> Result<BranchRelation, Box<dyn std::error::Error + Send + Sync>> {
     if is_head && let Ok(Some(head_ref)) = repo.head_ref() {
         let head_name = head_ref.name().to_string();
         if head_name == format!("refs/heads/{}", branch.name) {
@@ -326,7 +322,7 @@ fn branch_relation(
         return Ok(BranchRelation::OnBranch);
     }
 
-    let base = repo.merge_base(target, branch.hash).map_err(git_err)?;
+    let base = repo.merge_base(target, branch.hash)?;
     if base == target {
         Ok(BranchRelation::OnBranch)
     } else {
@@ -1042,5 +1038,53 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, Error::RevisionNotFound(_)));
+    }
+
+    #[test]
+    fn not_traceable_unrelated_history() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        git_in(dir.path(), &["checkout", "--orphan", "orphan"]);
+        let orphan_hash = commit_at(dir.path(), "2026-04-10T13:00:00Z");
+        let err = run(&Options {
+            dir: dir.path(),
+            target: Some(&orphan_hash),
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::NotTraceable { .. }));
+    }
+
+    #[test]
+    fn head_on_different_branch() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        git_in(dir.path(), &["checkout", "-b", "feature"]);
+        commit_at(dir.path(), "2026-04-10T13:00:00Z");
+        let result = run(&Options {
+            dir: dir.path(),
+            branch: Some("main"),
+            dirty_suffix: Some("-dirty"),
+            include_dirty_hash: false,
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(result, "20260410.1-dirty");
+    }
+
+    #[test]
+    fn reverse_decreasing_dates() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-11T12:00:00Z");
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        let err = run(&Options {
+            dir: dir.path(),
+            target: Some("20260409.1"),
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::DecreasingDate { .. }));
     }
 }

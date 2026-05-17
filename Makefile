@@ -15,7 +15,9 @@ acceptance: build
 	GITCALVER=$(CURDIR)/target/release/gitcalver ../sh/test/test.sh
 
 coverage:
-	cargo +nightly llvm-cov test
+	cargo +nightly llvm-cov test \
+		--fail-under-functions 100 \
+		--fail-under-lines 100
 
 publish publish-dry-run:
 	@set -e; \

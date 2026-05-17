@@ -216,6 +216,7 @@ mod tests {
         code
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn git_in(dir: &std::path::Path, cli_args: &[&str]) {
         let output = std::process::Command::new("git")
             .args(cli_args)
@@ -229,6 +230,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn commit_at(dir: &std::path::Path, date: &str) {
         let output = std::process::Command::new("git")
             .args(["commit", "--allow-empty", "-m", "test"])
@@ -301,6 +303,15 @@ mod tests {
         assert_eq!(cli_in_dir(dir.path(), &["--branch", "main"]), 2);
     }
 
+    #[test]
+    fn cli_dirty_staged_exit_code() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        std::fs::write(dir.path().join("staged.txt"), "staged").unwrap();
+        git_in(dir.path(), &["add", "staged.txt"]);
+        assert_eq!(cli_in_dir(dir.path(), &["--branch", "main"]), 2);
+    }
+
     // parse_args tests
 
     #[test]
@@ -331,6 +342,24 @@ mod tests {
     #[test]
     fn parse_unknown_option() {
         assert!(parse_args(&args(&["--foo"])).is_err());
+    }
+
+    #[test]
+    fn parse_double_dash_positional() {
+        let parsed = parse_args(&args(&["--", "--looks-like-flag"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.positional, "--looks-like-flag");
+    }
+
+    #[test]
+    fn parse_double_dash_extra_arg() {
+        assert!(parse_args(&args(&["--", "abc123", "extra"])).is_err());
+    }
+
+    #[test]
+    fn parse_two_positionals() {
+        assert!(parse_args(&args(&["abc123", "def456"])).is_err());
     }
 
     #[test]
@@ -384,6 +413,20 @@ mod tests {
             branch: String::new(),
             short: false,
             positional: String::new(),
+        };
+        assert!(validate(&parsed).is_err());
+    }
+
+    #[test]
+    fn validate_short_without_version() {
+        let parsed = ParsedArgs {
+            prefix: String::new(),
+            dirty_string: None,
+            no_dirty: false,
+            no_dirty_hash: false,
+            branch: String::new(),
+            short: true,
+            positional: "not-a-version".into(),
         };
         assert!(validate(&parsed).is_err());
     }
