@@ -28,7 +28,7 @@ publish publish-dry-run:
 	tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
 	git archive HEAD | tar -x -C "$$tmp"; \
-	awk -v ver="$$ver" '/^\[package\]$$/ {print; print "version = \"" ver "\""; next} 1' "$$src/Cargo.toml" > "$$tmp/Cargo.toml"; \
+	awk -v ver="$$ver" '/^\[package\]$$/ {print; print "version = \"" ver "\""; print "publish = true"; next} 1' "$$src/Cargo.toml" > "$$tmp/Cargo.toml"; \
 	cd "$$tmp"; \
 	CARGO_TARGET_DIR="$$src/target" cargo check --quiet; \
 	CARGO_TARGET_DIR="$$src/target" cargo publish $(if $(findstring dry,$@),--dry-run,)
