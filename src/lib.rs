@@ -454,6 +454,85 @@ fn looks_like_date(s: &str) -> bool {
     year >= 1970 && (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PatchError {
+    #[error("invalid TOML: {0}")]
+    Parse(Box<toml_edit::TomlError>),
+
+    #[error("manifest has no `[package]` section")]
+    MissingPackage,
+
+    #[error("workspace version inheritance not supported; set version in package manifest")]
+    WorkspaceInheritance,
+
+    #[error(
+        "manifest version `{existing}` differs from computed `{computed}`; refusing to overwrite"
+    )]
+    VersionMismatch { existing: String, computed: String },
+
+    #[error("manifest sets `publish = false`; refusing to overwrite")]
+    PublishFalse,
+}
+
+impl From<toml_edit::TomlError> for PatchError {
+    fn from(e: toml_edit::TomlError) -> Self {
+        Self::Parse(Box::new(e))
+    }
+}
+
+/// Patch a Cargo manifest by setting `[package].version` and `[package].publish = true`,
+/// preserving comments and formatting.
+///
+/// If `version` or `publish` are already set to matching values, the operation is
+/// idempotent. Mismatched values cause an error rather than overwriting, protecting
+/// against accidentally pointing at the source manifest instead of a staged copy.
+///
+/// # Errors
+///
+/// Returns `PatchError` for malformed TOML, a missing `[package]` table, workspace
+/// version inheritance, or a manifest that already sets `version`/`publish` to a
+/// value that conflicts with the desired one.
+pub fn patch_manifest(toml_src: &str, version: &str) -> Result<String, PatchError> {
+    let mut doc: toml_edit::DocumentMut = toml_src.parse()?;
+
+    let package = doc
+        .get_mut("package")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or(PatchError::MissingPackage)?;
+
+    match package.get("version") {
+        None => {
+            package.insert("version", toml_edit::value(version));
+        }
+        Some(item) => match item.as_value().and_then(toml_edit::Value::as_str) {
+            Some(existing) if existing == version => {}
+            Some(existing) => {
+                return Err(PatchError::VersionMismatch {
+                    existing: existing.to_owned(),
+                    computed: version.to_owned(),
+                });
+            }
+            None => return Err(PatchError::WorkspaceInheritance),
+        },
+    }
+
+    match package.get("publish") {
+        None => {
+            package.insert("publish", toml_edit::value(true));
+        }
+        Some(item) => match item.as_value() {
+            Some(toml_edit::Value::Boolean(b)) if *b.value() => {}
+            Some(toml_edit::Value::Boolean(_)) => return Err(PatchError::PublishFalse),
+            // `publish = ["registry", ...]` restricts publishing to the listed
+            // registries; treat as already configured and leave untouched.
+            Some(toml_edit::Value::Array(_)) => {}
+            _ => return Err(PatchError::WorkspaceInheritance),
+        },
+    }
+
+    Ok(doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1165,121 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, Error::DecreasingDate { .. }));
+    }
+
+    // patch_manifest tests
+
+    const SRC_WITH_COMMENT: &str = "\
+[package]
+# Load-bearing comment that must survive round-trip.
+name = \"demo\"
+edition = \"2024\"
+";
+
+    #[test]
+    fn patch_inserts_version_and_publish() {
+        let out = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
+        assert!(out.contains("# Load-bearing comment"));
+        assert!(out.contains("version = \"0.20260518.1\""));
+        assert!(out.contains("publish = true"));
+    }
+
+    #[test]
+    fn patch_preserves_trailing_newline() {
+        let out = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn patch_idempotent_on_matching_version() {
+        let once = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
+        let twice = patch_manifest(&once, "0.20260518.1").unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn patch_rejects_mismatched_version() {
+        let src = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        let err = patch_manifest(src, "0.2.0").unwrap_err();
+        assert!(matches!(
+            err,
+            PatchError::VersionMismatch { ref existing, ref computed }
+                if existing == "0.1.0" && computed == "0.2.0"
+        ));
+    }
+
+    #[test]
+    fn patch_rejects_publish_false() {
+        let src = "[package]\nname = \"demo\"\npublish = false\n";
+        let err = patch_manifest(src, "0.1.0").unwrap_err();
+        assert!(matches!(err, PatchError::PublishFalse));
+    }
+
+    #[test]
+    fn patch_accepts_publish_true() {
+        let src = "[package]\nname = \"demo\"\npublish = true\n";
+        let out = patch_manifest(src, "0.1.0").unwrap();
+        assert!(out.contains("version = \"0.1.0\""));
+        assert!(out.matches("publish = true").count() == 1);
+    }
+
+    #[test]
+    fn patch_accepts_publish_registry_list() {
+        let src = "[package]\nname = \"demo\"\npublish = [\"my-registry\"]\n";
+        let out = patch_manifest(src, "0.1.0").unwrap();
+        assert!(out.contains("version = \"0.1.0\""));
+        assert!(out.contains("publish = [\"my-registry\"]"));
+    }
+
+    #[test]
+    fn patch_rejects_missing_package() {
+        let src = "[dependencies]\nfoo = \"1\"\n";
+        let err = patch_manifest(src, "0.1.0").unwrap_err();
+        assert!(matches!(err, PatchError::MissingPackage));
+    }
+
+    #[test]
+    fn patch_rejects_workspace_version_inheritance() {
+        let src = "[package]\nname = \"demo\"\nversion.workspace = true\n";
+        let err = patch_manifest(src, "0.1.0").unwrap_err();
+        assert!(matches!(err, PatchError::WorkspaceInheritance));
+    }
+
+    #[test]
+    fn patch_rejects_workspace_publish_inheritance() {
+        let src = "[package]\nname = \"demo\"\npublish.workspace = true\n";
+        let err = patch_manifest(src, "0.1.0").unwrap_err();
+        assert!(matches!(err, PatchError::WorkspaceInheritance));
+    }
+
+    #[test]
+    fn patch_rejects_malformed_toml() {
+        let src = "[package\nname = \"demo\"\n";
+        let err = patch_manifest(src, "0.1.0").unwrap_err();
+        assert!(matches!(err, PatchError::Parse(_)));
+    }
+
+    #[test]
+    fn patch_error_display() {
+        assert_eq!(
+            PatchError::MissingPackage.to_string(),
+            "manifest has no `[package]` section"
+        );
+        assert_eq!(
+            PatchError::WorkspaceInheritance.to_string(),
+            "workspace version inheritance not supported; set version in package manifest"
+        );
+        assert_eq!(
+            PatchError::PublishFalse.to_string(),
+            "manifest sets `publish = false`; refusing to overwrite"
+        );
+        let mismatch = PatchError::VersionMismatch {
+            existing: "0.1.0".into(),
+            computed: "0.2.0".into(),
+        };
+        assert!(mismatch.to_string().contains("0.1.0"));
+        assert!(mismatch.to_string().contains("0.2.0"));
+        let parse_err = patch_manifest("[package\n", "0.1.0").unwrap_err();
+        assert!(parse_err.to_string().starts_with("invalid TOML:"));
     }
 }

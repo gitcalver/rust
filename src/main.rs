@@ -6,8 +6,11 @@ use gitcalver::Options;
 
 const USAGE: &str = "\
 Usage: gitcalver [options] [REVISION | VERSION]
+       gitcalver prepare-publish [options] --manifest PATH [--source-dir DIR]
 
 Compute a gitcalver version for a git commit, or find the commit for a version.
+Use `prepare-publish` to compute a version and patch a Cargo.toml in one shot
+(intended for release flows; run `gitcalver prepare-publish --help` for details).
 
 Options:
   --prefix PREFIX     Prepend PREFIX to version (default: empty)
@@ -19,6 +22,24 @@ Options:
   --help              Show this help
 ";
 
+const USAGE_PREPARE_PUBLISH: &str = "\
+Usage: gitcalver prepare-publish [options] --manifest PATH [--source-dir DIR]
+
+Compute a gitcalver version for HEAD and patch the given Cargo.toml so that
+`[package].version` is set to that version and `[package].publish = true`.
+Comments and formatting are preserved. The computed version is printed to
+stdout. Exits non-zero (and leaves the manifest unchanged) on a dirty
+workspace, an off-branch HEAD, or a manifest that already sets `version` or
+`publish` to a conflicting value.
+
+Options:
+  --manifest PATH     Cargo.toml to patch (required)
+  --source-dir DIR    Git repo to compute version from (default: .)
+  --prefix PREFIX     Prepend PREFIX to version (default: empty)
+  --branch BRANCH     Override default branch detection
+  --help              Show this help
+";
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,6 +47,10 @@ fn main() -> ExitCode {
 }
 
 fn cli(args: &[String]) -> u8 {
+    if args.first().map(String::as_str) == Some("prepare-publish") {
+        return cli_prepare_publish(&args[1..]);
+    }
+
     let parsed = match parse_args(args) {
         Ok(Some(parsed)) => parsed,
         Ok(None) => {
@@ -56,6 +81,147 @@ fn cli(args: &[String]) -> u8 {
             code
         }
     }
+}
+
+fn cli_prepare_publish(args: &[String]) -> u8 {
+    let parsed = match parse_prepare_args(args) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => {
+            print!("{USAGE_PREPARE_PUBLISH}");
+            return 0;
+        }
+        Err(msg) => {
+            eprintln!("gitcalver: {msg}");
+            return 1;
+        }
+    };
+
+    let opts = Options {
+        dir: &parsed.source_dir,
+        target: None,
+        prefix: &parsed.prefix,
+        dirty_suffix: None,
+        include_dirty_hash: true,
+        branch: if parsed.branch.is_empty() {
+            None
+        } else {
+            Some(parsed.branch.as_str())
+        },
+        short: false,
+    };
+
+    let version = match gitcalver::run(&opts) {
+        Ok(v) => v,
+        Err(gitcalver::Error::DirtyWorkspace) => {
+            eprintln!("gitcalver: working tree is dirty; commit or stash before publishing");
+            return 2;
+        }
+        Err(e) => {
+            let code = exit_code(&e);
+            eprintln!("gitcalver: {e}");
+            return code;
+        }
+    };
+
+    let src = match std::fs::read_to_string(&parsed.manifest) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "gitcalver: failed to read manifest at {}: {e}",
+                parsed.manifest.display()
+            );
+            return 1;
+        }
+    };
+
+    let patched = match gitcalver::patch_manifest(&src, &version) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gitcalver: {e}");
+            return 1;
+        }
+    };
+
+    if let Err(e) = atomic_write(&parsed.manifest, &patched) {
+        eprintln!(
+            "gitcalver: failed to write manifest at {}: {e}",
+            parsed.manifest.display()
+        );
+        return 1;
+    }
+
+    println!("{version}");
+    0
+}
+
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
+    std::fs::write(&tmp_path, contents)?;
+    std::fs::rename(&tmp_path, path)
+}
+
+struct PrepareArgs {
+    prefix: String,
+    branch: String,
+    manifest: std::path::PathBuf,
+    source_dir: std::path::PathBuf,
+}
+
+fn parse_prepare_args(args: &[String]) -> Result<Option<PrepareArgs>, String> {
+    let mut prefix = String::new();
+    let mut branch = String::new();
+    let mut manifest: Option<std::path::PathBuf> = None;
+    let mut source_dir: Option<std::path::PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--help" => return Ok(None),
+            "--prefix" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--prefix requires an argument".to_owned())?;
+                prefix.clone_from(v);
+            }
+            "--branch" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--branch requires an argument".to_owned())?;
+                branch.clone_from(v);
+            }
+            "--manifest" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--manifest requires an argument".to_owned())?;
+                manifest = Some(std::path::PathBuf::from(v));
+            }
+            "--source-dir" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--source-dir requires an argument".to_owned())?;
+                source_dir = Some(std::path::PathBuf::from(v));
+            }
+            _ => return Err(format!("unknown option: {arg}")),
+        }
+        i += 1;
+    }
+
+    let manifest = manifest.ok_or_else(|| "--manifest is required".to_owned())?;
+    let source_dir = source_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    Ok(Some(PrepareArgs {
+        prefix,
+        branch,
+        manifest,
+        source_dir,
+    }))
 }
 
 const fn exit_code(err: &gitcalver::Error) -> u8 {
@@ -491,5 +657,255 @@ mod tests {
             3
         );
         assert_eq!(exit_code(&gitcalver::Error::NotARepository), 1);
+    }
+
+    // prepare-publish tests
+
+    const MANIFEST_TEMPLATE: &str = "\
+[package]
+# Load-bearing comment.
+name = \"demo\"
+edition = \"2024\"
+";
+
+    fn write_manifest(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+        let path = dir.join("Cargo.toml");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_help() {
+        assert_eq!(cli(&args(&["prepare-publish", "--help"])), 0);
+    }
+
+    #[test]
+    fn prepare_missing_manifest_flag() {
+        assert_eq!(cli(&args(&["prepare-publish"])), 1);
+    }
+
+    #[test]
+    fn prepare_unknown_option() {
+        assert_eq!(
+            cli(&args(&[
+                "prepare-publish",
+                "--manifest",
+                "/tmp/x",
+                "--bogus"
+            ])),
+            1
+        );
+    }
+
+    #[test]
+    fn prepare_missing_arg_value() {
+        // Exercises each flag's "requires an argument" branch.
+        assert_eq!(cli(&args(&["prepare-publish", "--prefix"])), 1);
+        assert_eq!(cli(&args(&["prepare-publish", "--branch"])), 1);
+        assert_eq!(cli(&args(&["prepare-publish", "--manifest"])), 1);
+        assert_eq!(cli(&args(&["prepare-publish", "--source-dir"])), 1);
+    }
+
+    #[test]
+    fn prepare_source_dir_defaults_to_cwd() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        let manifest_str = manifest.to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+            ],
+        );
+        assert_eq!(code, 0);
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("version =")
+        );
+    }
+
+    #[test]
+    fn prepare_happy_path() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--prefix",
+                "0.",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 0);
+        let out = std::fs::read_to_string(&manifest).unwrap();
+        assert!(out.contains("# Load-bearing comment"));
+        assert!(out.contains("version = \"0.20260410.1\""));
+        assert!(out.contains("publish = true"));
+    }
+
+    #[test]
+    fn prepare_dirty_workspace_exit_code() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 2);
+        let out = std::fs::read_to_string(&manifest).unwrap();
+        assert_eq!(out, MANIFEST_TEMPLATE);
+    }
+
+    #[test]
+    fn prepare_other_run_error() {
+        // Trigger Error::NotARepository, which goes through the generic Err arm.
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = not_a_repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            not_a_repo.path(),
+            &[
+                "prepare-publish",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn prepare_manifest_not_readable() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                "/no/such/path/Cargo.toml",
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn prepare_mismatched_version() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(
+            staged.path(),
+            "[package]\nname = \"demo\"\nversion = \"9.9.9\"\n",
+        );
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn prepare_publish_false() {
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(
+            staged.path(),
+            "[package]\nname = \"demo\"\npublish = false\n",
+        );
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn prepare_write_failure() {
+        // Read + patch succeed; atomic_write fails because the `.tmp` sibling
+        // path is occupied by an existing directory.
+        let repo = new_repo();
+        commit_at(repo.path(), "2026-04-10T12:00:00Z");
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        std::fs::create_dir(staged.path().join("Cargo.toml.tmp")).unwrap();
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = repo.path().to_str().unwrap();
+        let code = cli_in_dir(
+            repo.path(),
+            &[
+                "prepare-publish",
+                "--branch",
+                "main",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            MANIFEST_TEMPLATE
+        );
     }
 }
