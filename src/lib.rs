@@ -432,9 +432,7 @@ fn try_parse_version_at(s: &str, start: usize) -> Option<(&str, usize)> {
         return None;
     }
 
-    let n_str = s[start + 9..]
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?;
+    let n_str = s[start + 9..].split(|c: char| !c.is_ascii_digit()).next()?;
     if n_str.is_empty() || (n_str.len() > 1 && n_str.starts_with('0')) {
         return None;
     }
