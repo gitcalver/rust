@@ -10,7 +10,7 @@
     },
     {
       description: "Automerge dev dependencies",
-      matchDepTypes: ["devDependencies"],
+      matchDepTypes: ["dev-dependencies"],
       automerge: true,
     },
   ],
