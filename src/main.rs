@@ -155,11 +155,29 @@ fn cli_prepare_publish(args: &[String]) -> u8 {
 }
 
 fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp_path = std::path::PathBuf::from(tmp_name);
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)
+
+    // Write and flush to disk before renaming so a crash cannot leave the
+    // manifest renamed-but-empty; clean up the temp file if anything fails.
+    let write_result = (|| {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 struct PrepareArgs {
@@ -296,6 +314,9 @@ fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
             "--" => {
                 i += 1;
                 if i < args.len() {
+                    if !parsed.positional.is_empty() {
+                        return Err(format!("unexpected argument: {}", args[i]));
+                    }
                     parsed.positional.clone_from(&args[i]);
                     i += 1;
                 }
@@ -526,6 +547,13 @@ mod tests {
     #[test]
     fn parse_two_positionals() {
         assert!(parse_args(&args(&["abc123", "def456"])).is_err());
+    }
+
+    #[test]
+    fn parse_positional_before_double_dash_is_rejected() {
+        // A positional before `--` plus one after is two positionals; reject it
+        // rather than silently letting the second clobber the first.
+        assert!(parse_args(&args(&["abc123", "--", "def456"])).is_err());
     }
 
     #[test]
