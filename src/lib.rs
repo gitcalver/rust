@@ -410,32 +410,31 @@ fn format_version(
 
 #[must_use]
 pub fn parse_version(s: &str) -> Option<(&str, usize)> {
-    if s.is_empty() {
-        return None;
-    }
-
-    let bytes = s.as_bytes();
-    for start in 0..bytes.len() {
-        if let Some(result) = try_parse_version_at(s, start) {
-            return Some(result);
-        }
-    }
-    None
+    (0..s.len()).find_map(|start| try_parse_version_at(s, start))
 }
 
 fn try_parse_version_at(s: &str, start: usize) -> Option<(&str, usize)> {
-    let s = &s[start..];
-    if s.len() < 10 {
+    let bytes = s.as_bytes();
+    // Need 8 date digits + '.' + at least one count digit.
+    if start + 10 > bytes.len() {
         return None;
     }
 
-    let (date_part, rest) = s.split_at(8);
-    if !date_part.bytes().all(|b| b.is_ascii_digit()) || !looks_like_date(date_part) {
+    // Operate on bytes for the fixed-width date so an arbitrary `start` (which
+    // may land inside a multi-byte UTF-8 char) never triggers a slicing panic.
+    // Requiring all eight to be ASCII digits also guarantees `start..start + 8`
+    // are char boundaries, making the following string slices safe.
+    if !bytes[start..start + 8].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let date_part = &s[start..start + 8];
+    if !looks_like_date(date_part) || bytes[start + 8] != b'.' {
         return None;
     }
 
-    let rest = rest.strip_prefix('.')?;
-    let n_str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    let n_str = s[start + 9..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?;
     if n_str.is_empty() || (n_str.len() > 1 && n_str.starts_with('0')) {
         return None;
     }
@@ -637,6 +636,23 @@ mod tests {
             parse_version("20260412.5-dirty.abc1234"),
             Some(("20260412", 5)),
         );
+    }
+
+    #[test]
+    fn parse_version_non_ascii_does_not_panic() {
+        // Multi-byte UTF-8 bytes must not cause a slicing panic, whether they
+        // precede, follow, or fall inside the candidate date window.
+        assert_eq!(parse_version("日20260412.7"), Some(("20260412", 7)));
+        assert_eq!(parse_version("café20260412.1"), Some(("20260412", 1)));
+        assert_eq!(parse_version("20260412.1é"), Some(("20260412", 1)));
+        assert_eq!(parse_version("1234567日8.1"), None);
+        assert_eq!(parse_version("é"), None);
+    }
+
+    #[test]
+    fn parse_version_overflow_rejected() {
+        // usize::MAX + 1 must not overflow-panic; it is simply not a version.
+        assert_eq!(parse_version("20260412.18446744073709551616"), None);
     }
 
     #[test]
