@@ -557,6 +557,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_double_dash_only() {
+        // `--` with nothing after ends option parsing and leaves no positional.
+        let parsed = parse_args(&args(&["--"])).unwrap().unwrap();
+        assert_eq!(parsed.positional, "");
+    }
+
+    #[test]
     fn parse_all_flags() {
         let parsed = parse_args(&args(&[
             "--prefix",
@@ -934,6 +941,22 @@ edition = \"2024\"
         assert_eq!(
             std::fs::read_to_string(&manifest).unwrap(),
             MANIFEST_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn atomic_write_rename_failure_cleans_up_temp() {
+        // The temp file writes fine, but renaming it onto an existing directory
+        // fails; atomic_write must remove the temp file and propagate the error.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        atomic_write(&dest, "contents").unwrap_err();
+
+        assert!(
+            !dir.path().join("dest.tmp").exists(),
+            "temp file should be removed when the rename fails"
         );
     }
 }
