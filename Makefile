@@ -1,3 +1,11 @@
+CONFORMANCE_DIR ?= ../sh
+# Pinned to sh's last 0.2 commit. `make acceptance` is expected to FAIL at
+# this pin: rust already implements the 0.3 counting rule, and the 0.2
+# suite's merge-count expectations differ by design. Nothing in CI runs this
+# target; re-pin to sh's 0.3 commit once sh/spec 0.3 land (see the 0.3
+# rollout plan), after which it must pass again.
+CONFORMANCE_SHA := a7f5c0600057d05028467cda8c65b36d5aa1eaf5
+
 build:
 	cargo build --release
 
@@ -12,7 +20,12 @@ fmt:
 	cargo fmt
 
 acceptance: build
-	GITCALVER=$(CURDIR)/target/release/gitcalver ../sh/test/test.sh
+	@test "$$(git -C "$(CONFORMANCE_DIR)" rev-parse "$(CONFORMANCE_SHA)^{commit}")" = "$(CONFORMANCE_SHA)"
+	@set -e; \
+	tmp="$$(mktemp)"; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	git -C "$(CONFORMANCE_DIR)" show "$(CONFORMANCE_SHA):test/test.sh" >"$$tmp"; \
+	GITCALVER="$(CURDIR)/target/release/gitcalver" sh "$$tmp"
 
 coverage:
 	cargo +nightly llvm-cov test \
