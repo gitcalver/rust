@@ -18,8 +18,16 @@ Options:
   --no-dirty          Refuse dirty versions (overrides --dirty)
   --no-dirty-hash     Suppress .HASH suffix (requires --dirty)
   --branch BRANCH     Override default branch detection
+  --remote REMOTE     Remote used for cached branch detection (default: origin)
   --short             Output short commit hash (reverse mode only)
   --help              Show this help
+
+Exit codes:
+  0   Success
+  1   Error (not a git repo, no commits, decreasing dates, etc.)
+  2   Dirty workspace or off default branch (without --dirty)
+  3   Cannot trace to default branch
+  4   Local history is insufficient to prove the result
 ";
 
 const USAGE_PREPARE_PUBLISH: &str = "\
@@ -37,6 +45,7 @@ Options:
   --source-dir DIR    Git repo to compute version from (default: .)
   --prefix PREFIX     Prepend PREFIX to version (default: empty)
   --branch BRANCH     Override default branch detection
+  --remote REMOTE     Remote used for cached branch detection (default: origin)
   --help              Show this help
 ";
 
@@ -106,6 +115,11 @@ fn cli_prepare_publish(args: &[String]) -> u8 {
             None
         } else {
             Some(parsed.branch.as_str())
+        },
+        remote: if parsed.remote.is_empty() {
+            None
+        } else {
+            Some(parsed.remote.as_str())
         },
         short: false,
     };
@@ -183,6 +197,7 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 struct PrepareArgs {
     prefix: String,
     branch: String,
+    remote: String,
     manifest: std::path::PathBuf,
     source_dir: std::path::PathBuf,
 }
@@ -190,6 +205,7 @@ struct PrepareArgs {
 fn parse_prepare_args(args: &[String]) -> Result<Option<PrepareArgs>, String> {
     let mut prefix = String::new();
     let mut branch = String::new();
+    let mut remote = String::new();
     let mut manifest: Option<std::path::PathBuf> = None;
     let mut source_dir: Option<std::path::PathBuf> = None;
 
@@ -211,6 +227,16 @@ fn parse_prepare_args(args: &[String]) -> Result<Option<PrepareArgs>, String> {
                     .get(i)
                     .ok_or_else(|| "--branch requires an argument".to_owned())?;
                 branch.clone_from(v);
+            }
+            "--remote" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--remote requires an argument".to_owned())?;
+                if v.is_empty() {
+                    return Err("--remote requires a non-empty argument".to_owned());
+                }
+                remote.clone_from(v);
             }
             "--manifest" => {
                 i += 1;
@@ -237,6 +263,7 @@ fn parse_prepare_args(args: &[String]) -> Result<Option<PrepareArgs>, String> {
     Ok(Some(PrepareArgs {
         prefix,
         branch,
+        remote,
         manifest,
         source_dir,
     }))
@@ -246,6 +273,7 @@ const fn exit_code(err: &gitcalver::Error) -> u8 {
     match err {
         gitcalver::Error::DirtyWorkspace | gitcalver::Error::NotOnDefaultBranch { .. } => 2,
         gitcalver::Error::NotTraceable { .. } => 3,
+        gitcalver::Error::IncompleteHistory(_) => 4,
         _ => 1,
     }
 }
@@ -256,6 +284,7 @@ struct ParsedArgs {
     no_dirty: bool,
     no_dirty_hash: bool,
     branch: String,
+    remote: String,
     short: bool,
     positional: String,
 }
@@ -267,6 +296,7 @@ fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
         no_dirty: false,
         no_dirty_hash: false,
         branch: String::new(),
+        remote: String::new(),
         short: false,
         positional: String::new(),
     };
@@ -304,6 +334,16 @@ fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
                     return Err("--branch requires an argument".to_owned());
                 }
                 parsed.branch.clone_from(&args[i]);
+            }
+            "--remote" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--remote requires an argument".to_owned());
+                }
+                if args[i].is_empty() {
+                    return Err("--remote requires a non-empty argument".to_owned());
+                }
+                parsed.remote.clone_from(&args[i]);
             }
             "--short" => {
                 parsed.short = true;
@@ -371,6 +411,12 @@ impl ParsedArgs {
             Some(self.branch.as_str())
         };
 
+        let remote = if self.remote.is_empty() {
+            None
+        } else {
+            Some(self.remote.as_str())
+        };
+
         Options {
             dir: std::path::Path::new("."),
             target,
@@ -378,6 +424,7 @@ impl ParsedArgs {
             dirty_suffix,
             include_dirty_hash: !self.no_dirty_hash,
             branch,
+            remote,
             short: self.short,
         }
     }
@@ -491,6 +538,37 @@ mod tests {
     }
 
     #[test]
+    fn cli_not_traceable_exit_code() {
+        // Complete history proves the orphan target shares nothing with
+        // the selected branch: exit 3, driven end-to-end through the CLI.
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        git_in(dir.path(), &["checkout", "--orphan", "orphan"]);
+        commit_at(dir.path(), "2026-04-10T13:00:00Z");
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let target = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        git_in(dir.path(), &["checkout", "main"]);
+        assert_eq!(cli_in_dir(dir.path(), &["--branch", "main", &target]), 3);
+    }
+
+    #[test]
+    fn cli_incomplete_history_exit_code() {
+        // A legacy grafts file rewrites stored ancestry, so the repository
+        // is rejected as incomplete: exit 4, driven end-to-end through the
+        // CLI.
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        let graft_dir = dir.path().join(".git/info");
+        std::fs::create_dir_all(&graft_dir).unwrap();
+        std::fs::write(graft_dir.join("grafts"), "").unwrap();
+        assert_eq!(cli_in_dir(dir.path(), &["--branch", "main"]), 4);
+    }
+
+    #[test]
     fn cli_dirty_staged_exit_code() {
         let dir = new_repo();
         commit_at(dir.path(), "2026-04-10T12:00:00Z");
@@ -574,6 +652,8 @@ mod tests {
             "--no-dirty-hash",
             "--branch",
             "main",
+            "--remote",
+            "upstream",
             "--short",
             "abc123",
         ]))
@@ -584,8 +664,19 @@ mod tests {
         assert!(parsed.no_dirty);
         assert!(parsed.no_dirty_hash);
         assert_eq!(parsed.branch, "main");
+        assert_eq!(parsed.remote, "upstream");
         assert!(parsed.short);
         assert_eq!(parsed.positional, "abc123");
+    }
+
+    #[test]
+    fn parse_remote_missing() {
+        assert!(parse_args(&args(&["--remote"])).is_err());
+    }
+
+    #[test]
+    fn parse_remote_empty() {
+        assert!(parse_args(&args(&["--remote", ""])).is_err());
     }
 
     // validate tests
@@ -598,6 +689,7 @@ mod tests {
             no_dirty: false,
             no_dirty_hash: true,
             branch: String::new(),
+            remote: String::new(),
             short: false,
             positional: String::new(),
         };
@@ -612,6 +704,7 @@ mod tests {
             no_dirty: false,
             no_dirty_hash: true,
             branch: String::new(),
+            remote: String::new(),
             short: false,
             positional: String::new(),
         };
@@ -626,6 +719,7 @@ mod tests {
             no_dirty: false,
             no_dirty_hash: false,
             branch: String::new(),
+            remote: String::new(),
             short: true,
             positional: "not-a-version".into(),
         };
@@ -642,6 +736,7 @@ mod tests {
             no_dirty: false,
             no_dirty_hash: true,
             branch: "main".into(),
+            remote: "upstream".into(),
             short: true,
             positional: "abc123".into(),
         };
@@ -650,6 +745,7 @@ mod tests {
         assert_eq!(opts.dirty_suffix, Some("-dirty"));
         assert!(!opts.include_dirty_hash);
         assert_eq!(opts.branch, Some("main"));
+        assert_eq!(opts.remote, Some("upstream"));
         assert!(opts.short);
         assert_eq!(opts.target, Some("abc123"));
     }
@@ -662,6 +758,7 @@ mod tests {
             no_dirty: true,
             no_dirty_hash: false,
             branch: String::new(),
+            remote: String::new(),
             short: false,
             positional: String::new(),
         };
@@ -669,6 +766,7 @@ mod tests {
         assert!(opts.dirty_suffix.is_none());
         assert!(opts.target.is_none());
         assert!(opts.branch.is_none());
+        assert!(opts.remote.is_none());
     }
 
     // exit_code tests
@@ -687,9 +785,12 @@ mod tests {
             exit_code(&gitcalver::Error::NotTraceable {
                 subject: String::new(),
                 branch: String::new(),
-                source: "test".into(),
             }),
             3
+        );
+        assert_eq!(
+            exit_code(&gitcalver::Error::IncompleteHistory(String::new())),
+            4
         );
         assert_eq!(exit_code(&gitcalver::Error::NotARepository), 1);
     }
@@ -737,8 +838,23 @@ edition = \"2024\"
         // Exercises each flag's "requires an argument" branch.
         assert_eq!(cli(&args(&["prepare-publish", "--prefix"])), 1);
         assert_eq!(cli(&args(&["prepare-publish", "--branch"])), 1);
+        assert_eq!(cli(&args(&["prepare-publish", "--remote"])), 1);
         assert_eq!(cli(&args(&["prepare-publish", "--manifest"])), 1);
         assert_eq!(cli(&args(&["prepare-publish", "--source-dir"])), 1);
+    }
+
+    #[test]
+    fn prepare_remote_empty_rejected() {
+        assert_eq!(
+            cli(&args(&[
+                "prepare-publish",
+                "--remote",
+                "",
+                "--manifest",
+                "/tmp/x"
+            ])),
+            1
+        );
     }
 
     #[test]
@@ -793,6 +909,40 @@ edition = \"2024\"
         assert!(out.contains("# Load-bearing comment"));
         assert!(out.contains("version = \"0.20260410.1\""));
         assert!(out.contains("publish = true"));
+    }
+
+    #[test]
+    fn prepare_publish_remote_flag_threaded_through() {
+        let remote_repo = new_repo();
+        commit_at(remote_repo.path(), "2026-04-10T12:00:00Z");
+        let parent = tempfile::tempdir().unwrap();
+        git_in(
+            parent.path(),
+            &["clone", remote_repo.path().to_str().unwrap(), "local"],
+        );
+        let local = parent.path().join("local");
+        git_in(&local, &["remote", "rename", "origin", "upstream"]);
+        commit_at(&local, "2026-04-10T13:00:00Z");
+
+        let staged = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(staged.path(), MANIFEST_TEMPLATE);
+        let manifest_str = manifest.to_str().unwrap();
+        let source_str = local.to_str().unwrap();
+        let code = cli_in_dir(
+            &local,
+            &[
+                "prepare-publish",
+                "--remote",
+                "upstream",
+                "--manifest",
+                manifest_str,
+                "--source-dir",
+                source_str,
+            ],
+        );
+        assert_eq!(code, 0);
+        let out = std::fs::read_to_string(&manifest).unwrap();
+        assert!(out.contains("version = \"20260410.2\""));
     }
 
     #[test]

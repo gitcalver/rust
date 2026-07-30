@@ -1,5 +1,6 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use gix::ObjectId;
-use gix::prelude::ObjectIdExt;
 use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,12 +12,7 @@ pub enum Error {
     NotOnDefaultBranch { subject: String, branch: String },
 
     #[error("{subject} has no common history with the default branch ({branch})")]
-    NotTraceable {
-        subject: String,
-        branch: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    NotTraceable { subject: String, branch: String },
 
     #[error("cannot determine default branch")]
     NoDefaultBranch,
@@ -36,6 +32,9 @@ pub enum Error {
     #[error("version not found: {0}")]
     VersionNotFound(String),
 
+    #[error("local history cannot prove the result: {0}")]
+    IncompleteHistory(String),
+
     #[error("{0}")]
     Git(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -47,6 +46,7 @@ pub struct Options<'a> {
     pub dirty_suffix: Option<&'a str>,
     pub include_dirty_hash: bool,
     pub branch: Option<&'a str>,
+    pub remote: Option<&'a str>,
     pub short: bool,
 }
 
@@ -59,6 +59,7 @@ impl Default for Options<'_> {
             dirty_suffix: None,
             include_dirty_hash: true,
             branch: None,
+            remote: None,
             short: false,
         }
     }
@@ -75,9 +76,16 @@ impl Default for Options<'_> {
 ///
 /// Returns `Error` if the directory is not a git repository, the workspace is
 /// dirty (unless allowed), the target is not on the default branch, or commit
-/// history is malformed.
+/// history is malformed or locally incomplete.
 pub fn run(opts: &Options<'_>) -> Result<String, Error> {
-    let repo = gix::discover(opts.dir).map_err(|_| Error::NotARepository)?;
+    let repo = open_repo(opts.dir)?;
+
+    if graft_file_path(&repo).is_file() {
+        return Err(Error::IncompleteHistory(format!(
+            "commit graft file is not supported: {}",
+            graft_file_path(&repo).display()
+        )));
+    }
 
     if let Some(target) = opts.target
         && let Some((date_str, n)) = parse_version(target)
@@ -86,6 +94,47 @@ pub fn run(opts: &Options<'_>) -> Result<String, Error> {
     }
 
     forward(&repo, opts)
+}
+
+/// Open the repository with replacement refs disabled at the object-store
+/// level (so every subsequent lookup ignores them, with no process-global
+/// state) rather than relying on an environment variable.
+///
+/// The key must be `core.useReplaceRefs`: it is the only key gix's
+/// `replacement_objects_refs_prefix()` gate actually reads (the
+/// `gitoxide.objects.noReplace` key is defined but never consulted in gix
+/// 0.86), and an API-level override outranks both the repository's own
+/// config and the `GIT_NO_REPLACE_OBJECTS` environment mapping.
+///
+/// gix 0.86 inverts the gate: `replacement_objects_refs_prefix()` assigns
+/// the *enabled* value to a variable named `is_disabled`, so `true` is what
+/// actually disables replacement honoring, and a repository setting
+/// `core.useReplaceRefs=false` would otherwise enable it. Overriding to
+/// `true` disables it under that inversion; the inert `replaceRefBase`
+/// override keeps it disabled even if a future gix fixes the inversion and
+/// starts treating `true` as enabled. The `replace_ref_ignored` test pins
+/// all repository-config permutations so a gix upgrade that changes this
+/// gate fails loudly.
+fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
+    const NO_REPLACE_OVERRIDES: [&str; 2] = [
+        "core.useReplaceRefs=true",
+        "gitoxide.objects.replaceRefBase=refs/gitcalver/replace-disabled/",
+    ];
+    let mut trust_map = gix::sec::trust::Mapping::<gix::open::Options>::default();
+    trust_map.full = trust_map.full.config_overrides(NO_REPLACE_OVERRIDES);
+    trust_map.reduced = trust_map.reduced.config_overrides(NO_REPLACE_OVERRIDES);
+
+    gix::ThreadSafeRepository::discover_opts(
+        dir,
+        gix::discover::upwards::Options::default(),
+        trust_map,
+    )
+    .map(|repo| repo.to_thread_local())
+    .map_err(|_| Error::NotARepository)
+}
+
+fn graft_file_path(repo: &gix::Repository) -> std::path::PathBuf {
+    repo.common_dir().join("info/grafts")
 }
 
 fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> {
@@ -100,38 +149,39 @@ fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> 
     };
 
     let subject = opts.target.unwrap_or("HEAD");
-    let branch = detect_branch(repo, opts.branch)?;
-    let relation = branch_relation(repo, target_id, &branch, is_head).map_err(|source| {
-        Error::NotTraceable {
-            subject: subject.to_owned(),
-            branch: branch.name.clone(),
-            source,
-        }
-    })?;
+    let remote = opts.remote.unwrap_or("origin");
+    let branch_name = detect_branch_name(repo, opts.branch, remote)?;
+    let branch_tip = resolve_branch_tip(repo, &branch_name, remote)?;
 
-    let (version_commit, off_branch) = match relation {
-        BranchRelation::OnBranch => (target_id, false),
-        BranchRelation::OffBranch { merge_base } => (merge_base, true),
+    let anchor = locate_anchor(repo, target_id, branch_tip, subject, &branch_name)?;
+
+    let (version_commit, off_branch) = match anchor {
+        Anchor::OnChain => (target_id, false),
+        Anchor::OffChain(anchor_id) => (anchor_id, true),
     };
 
-    let workspace_dirty = if is_head { check_dirty(repo)? } else { false };
+    let workspace_dirty = if is_head && !repo.is_bare() {
+        check_dirty(repo)?
+    } else {
+        false
+    };
     let dirty = workspace_dirty || off_branch;
 
     if dirty && opts.dirty_suffix.is_none() {
         return if off_branch {
             Err(Error::NotOnDefaultBranch {
                 subject: subject.to_owned(),
-                branch: branch.name,
+                branch: branch_name,
             })
         } else {
             Err(Error::DirtyWorkspace)
         };
     }
 
-    let (date, count) = walk_first_parent(repo, version_commit)?;
+    let (date, count) = cohort(repo, version_commit)?;
 
     let hash = if dirty && opts.include_dirty_hash {
-        short_hash(repo, target_id)
+        short_hash(target_id)
     } else {
         String::new()
     };
@@ -152,14 +202,115 @@ fn reverse(
     date_str: &str,
     n: usize,
 ) -> Result<String, Error> {
-    let branch = detect_branch(repo, opts.branch)?;
+    let remote = opts.remote.unwrap_or("origin");
+    let branch_name = detect_branch_name(repo, opts.branch, remote)?;
+    let branch_tip = resolve_branch_tip(repo, &branch_name, remote)?;
 
-    let mut candidates = Vec::new();
-    let mut current = branch.hash;
+    let mut members = date_block_members(repo, branch_tip, date_str)?;
+    // `members` is newest-first from the chain walk; cohort size increases
+    // strictly oldest-to-newest within a block, so search that direction to
+    // exploit the early-stop optimization.
+    members.reverse();
+
+    for member in members {
+        let (_, count) = cohort(repo, member)?;
+        match count.cmp(&n) {
+            std::cmp::Ordering::Equal => {
+                return Ok(if opts.short {
+                    short_hash(member)
+                } else {
+                    member.to_string()
+                });
+            }
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    Err(Error::VersionNotFound(
+        opts.target.unwrap_or_default().to_owned(),
+    ))
+}
+
+/// Compute the 0.3 same-date cohort: the set of commits reachable from
+/// `start` through any parent whose UTC committer date equals its own.
+/// Traversal prunes at the first older-dated commit on each path and fails
+/// fast on a newer-dated one or a commit that cannot be loaded, because the
+/// count is defined as the *size* of the whole cohort — one unprovable
+/// same-date parent makes the count itself unprovable.
+fn cohort(repo: &gix::Repository, start: ObjectId) -> Result<(String, usize), Error> {
+    let start_commit = repo.find_commit(start).map_err(git_err)?;
+    let date = committer_date(&start_commit)?;
+    let shallow = shallow_cuts(repo)?;
+
+    let mut visited = HashSet::new();
+    visited.insert(start);
+    let mut queue = VecDeque::new();
+    queue.push_back(start_commit);
+    let mut count = 0usize;
+
+    while let Some(commit) = queue.pop_front() {
+        count += 1;
+        // A counted commit recorded as a shallow boundary hides its true
+        // ancestry even when its stored parents' objects happen to be
+        // present through another path: git's traversal grafts end there,
+        // so the reference implementation cannot see past it, and every
+        // implementation must agree. A boundary-marked true root (real
+        // depth-limited clones list those too) hides nothing.
+        if commit.parent_ids().next().is_some() && shallow.contains(&commit.id().detach()) {
+            return Err(Error::IncompleteHistory(format!(
+                "local history ended inside the {date} date block"
+            )));
+        }
+        for parent in commit.parent_ids() {
+            let parent_id = parent.detach();
+            if !visited.insert(parent_id) {
+                continue;
+            }
+            let parent_commit = repo.find_commit(parent_id).map_err(|_| {
+                Error::IncompleteHistory(format!(
+                    "local history ended inside the {date} date block"
+                ))
+            })?;
+            let parent_date = committer_date(&parent_commit)?;
+            match parent_date.as_str().cmp(date.as_str()) {
+                std::cmp::Ordering::Equal => queue.push_back(parent_commit),
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Greater => {
+                    return Err(Error::DecreasingDate {
+                        head: date,
+                        earlier: parent_date,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok((date, count))
+}
+
+/// Walk the selected chain's first-parent history collecting members whose
+/// date equals `target_date`, proving either a strictly-older boundary
+/// commit or a true root. Returns members newest-first. A same-date run that
+/// cannot be extended because the next commit is missing is incomplete
+/// history, not a proven boundary — unlike a plain `break`, which would
+/// silently treat that as if the boundary were proven.
+fn date_block_members(
+    repo: &gix::Repository,
+    chain_tip: ObjectId,
+    target_date: &str,
+) -> Result<Vec<ObjectId>, Error> {
+    let mut members = Vec::new();
+    let mut current = chain_tip;
     let mut prev_date: Option<String> = None;
+    let shallow = shallow_cuts(repo)?;
 
     loop {
-        let commit = repo.find_commit(current).map_err(git_err)?;
+        let commit = repo.find_commit(current).map_err(|_| {
+            Error::IncompleteHistory(
+                "local history ended before the date block's boundary could be proved".to_owned(),
+            )
+        })?;
         let commit_date = committer_date(&commit)?;
 
         if let Some(ref prev) = prev_date
@@ -171,62 +322,38 @@ fn reverse(
             });
         }
 
-        if commit_date == date_str {
-            candidates.push(current);
-        } else if commit_date.as_str() < date_str {
-            break;
+        if commit_date == target_date {
+            members.push(current);
+        } else if commit_date.as_str() < target_date {
+            return Ok(members);
         }
 
         prev_date = Some(commit_date);
 
+        // Traversal ends at a shallow boundary even when the stored
+        // parent's object is present through another path; since the
+        // strictly-older boundary has not been proved yet at this point,
+        // the block cannot be proved either.
+        if first_parent_id(&commit).is_some() && shallow.contains(&current) {
+            return Err(Error::IncompleteHistory(
+                "local history ended before the date block's boundary could be proved".to_owned(),
+            ));
+        }
+
         match first_parent_id(&commit) {
             Some(parent) => current = parent,
-            None => break,
+            None => return Ok(members),
         }
-    }
-
-    if n > candidates.len() {
-        return Err(Error::VersionNotFound(
-            opts.target.unwrap_or_default().to_owned(),
-        ));
-    }
-
-    // N=1 is oldest on that date, N=len is newest; candidates are newest-first.
-    let target_hash = candidates[candidates.len() - n];
-
-    if opts.short {
-        Ok(short_hash(repo, target_hash))
-    } else {
-        Ok(target_hash.to_string())
     }
 }
 
-fn walk_first_parent(repo: &gix::Repository, start: ObjectId) -> Result<(String, usize), Error> {
-    let commit = repo.find_commit(start).map_err(git_err)?;
-    let date = committer_date(&commit)?;
-    let mut count = 1;
-    let mut current_commit = commit;
-
-    while let Some(parent_id) = first_parent_id(&current_commit) {
-        let parent = repo.find_commit(parent_id).map_err(git_err)?;
-        let parent_date = committer_date(&parent)?;
-
-        match parent_date.cmp(&date) {
-            std::cmp::Ordering::Equal => {
-                count += 1;
-                current_commit = parent;
-            }
-            std::cmp::Ordering::Greater => {
-                return Err(Error::DecreasingDate {
-                    head: date,
-                    earlier: parent_date,
-                });
-            }
-            std::cmp::Ordering::Less => break,
-        }
-    }
-
-    Ok((date, count))
+/// The commits recorded as shallow-clone cuts in `.git/shallow`.
+fn shallow_cuts(repo: &gix::Repository) -> Result<HashSet<ObjectId>, Error> {
+    Ok(repo
+        .shallow_commits()
+        .map_err(git_err)?
+        .map(|cuts| cuts.iter().copied().collect())
+        .unwrap_or_default())
 }
 
 fn committer_date(commit: &gix::Commit<'_>) -> Result<String, Error> {
@@ -238,98 +365,182 @@ fn first_parent_id(commit: &gix::Commit<'_>) -> Option<ObjectId> {
     commit.parent_ids().next().map(gix::Id::detach)
 }
 
-struct BranchInfo {
-    name: String,
-    hash: ObjectId,
+/// A branch's first-parent chain, newest to oldest, with an index for O(1)
+/// membership checks. `incomplete` records whether the walk stopped at a
+/// load failure rather than a true root.
+struct Chain {
+    members: Vec<ObjectId>,
+    index: HashMap<ObjectId, usize>,
+    incomplete: bool,
 }
 
-fn detect_branch(repo: &gix::Repository, override_name: Option<&str>) -> Result<BranchInfo, Error> {
-    if let Some(name) = override_name {
-        for ref_name in [
-            format!("refs/remotes/origin/{name}"),
-            format!("refs/heads/{name}"),
-        ] {
-            if let Some(id) = try_resolve_ref(repo, &ref_name) {
-                return Ok(BranchInfo {
-                    name: name.to_owned(),
-                    hash: id,
-                });
+fn build_chain(repo: &gix::Repository, tip: ObjectId) -> Chain {
+    let mut members = Vec::new();
+    let mut index = HashMap::new();
+    let mut incomplete = false;
+    let mut current = tip;
+
+    loop {
+        if let Ok(commit) = repo.find_commit(current) {
+            index.insert(current, members.len());
+            members.push(current);
+            match first_parent_id(&commit) {
+                Some(parent) => current = parent,
+                None => break,
             }
+        } else {
+            incomplete = true;
+            break;
         }
-        return Err(Error::NoDefaultBranch);
     }
 
-    // origin/HEAD symbolic ref
-    if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD")
+    Chain {
+        members,
+        index,
+        incomplete,
+    }
+}
+
+enum Anchor {
+    OnChain,
+    OffChain(ObjectId),
+}
+
+/// Locate the newest selected-chain commit reachable from `target` through
+/// any parent. `target` is enqueued first, so a `target` that is itself a
+/// chain member (at any position, not just the tip) is found immediately and
+/// classified `OnChain`; this makes on-chain and off-chain the same code
+/// path.
+///
+/// A chain hit prunes that path (everything past it on the chain is only
+/// ever older, never a better answer) but does not stop the search: other
+/// paths may still reach a newer chain member, and the spec requires the
+/// *newest* one, not merely the first one discovered by traversal order. A
+/// load failure marks the search incomplete without aborting it, matching
+/// cohort counting's opposite fail-fast rule: here any successful
+/// intersection anywhere answers the question, so only the failure to find
+/// *any* answer is disqualifying.
+fn locate_anchor(
+    repo: &gix::Repository,
+    target: ObjectId,
+    branch_tip: ObjectId,
+    subject: &str,
+    branch_name: &str,
+) -> Result<Anchor, Error> {
+    let chain = build_chain(repo, branch_tip);
+
+    let mut visited = HashSet::new();
+    visited.insert(target);
+    let mut queue = VecDeque::new();
+    queue.push_back(target);
+
+    let mut best: Option<usize> = None;
+    // The target walk and the chain walk fail differently: a truncated
+    // chain only hides members older than everything indexed, so an anchor
+    // found in the indexed part is still the newest, while an unreadable
+    // commit in the target's own ancestry leaves paths unexplored that
+    // could reach a newer chain member — then any anchor found elsewhere is
+    // unproven and the result must be incomplete history, not a guess.
+    let mut walk_incomplete = false;
+
+    while let Some(id) = queue.pop_front() {
+        if let Some(&idx) = chain.index.get(&id) {
+            best = Some(best.map_or(idx, |current_best| current_best.min(idx)));
+            continue;
+        }
+        match repo.find_commit(id) {
+            Ok(commit) => {
+                for parent in commit.parent_ids() {
+                    let parent_id = parent.detach();
+                    if visited.insert(parent_id) {
+                        queue.push_back(parent_id);
+                    }
+                }
+            }
+            Err(_) => walk_incomplete = true,
+        }
+    }
+
+    match best {
+        Some(idx) if chain.members[idx] == target => Ok(Anchor::OnChain),
+        Some(_) if walk_incomplete => Err(Error::IncompleteHistory(format!(
+            "local history cannot prove {subject}'s newest reachable anchor on the default branch ({branch_name})"
+        ))),
+        Some(idx) => Ok(Anchor::OffChain(chain.members[idx])),
+        None if walk_incomplete || chain.incomplete => Err(Error::IncompleteHistory(format!(
+            "local history cannot prove {subject}'s relationship to the default branch ({branch_name})"
+        ))),
+        None => Err(Error::NotTraceable {
+            subject: subject.to_owned(),
+            branch: branch_name.to_owned(),
+        }),
+    }
+}
+
+/// Determine the selected branch's name. Does not resolve a tip; see
+/// `resolve_branch_tip`, which is applied uniformly afterward so a name
+/// selected via a remote-tracking tier still prefers its local branch.
+fn detect_branch_name(
+    repo: &gix::Repository,
+    override_name: Option<&str>,
+    remote: &str,
+) -> Result<String, Error> {
+    if let Some(name) = override_name {
+        return Ok(name.to_owned());
+    }
+
+    let remote_prefix = format!("refs/remotes/{remote}/");
+    let symbolic_head = format!("{remote_prefix}HEAD");
+    if let Ok(r) = repo.find_reference(symbolic_head.as_str())
         && let Some(target_name) = r.target().try_name()
+        && let Some(short) = target_name
+            .as_bstr()
+            .to_string()
+            .strip_prefix(&remote_prefix)
     {
-        let target_str = target_name.to_string();
-        let short = target_str
-            .strip_prefix("refs/remotes/origin/")
-            .unwrap_or(&target_str);
-        if let Some(id) = try_resolve_ref(repo, &target_str) {
-            return Ok(BranchInfo {
-                name: short.to_owned(),
-                hash: id,
-            });
-        }
+        return Ok(short.to_owned());
     }
 
-    for (prefix, name) in [
-        ("refs/remotes/origin/", "main"),
-        ("refs/remotes/origin/", "master"),
-        ("refs/heads/", "main"),
-        ("refs/heads/", "master"),
-    ] {
-        if let Some(id) = try_resolve_ref(repo, &format!("{prefix}{name}")) {
-            return Ok(BranchInfo {
-                name: name.to_owned(),
-                hash: id,
-            });
+    for name in ["main", "master"] {
+        if repo
+            .find_reference(format!("{remote_prefix}{name}").as_str())
+            .is_ok()
+        {
+            return Ok(name.to_owned());
+        }
+    }
+    for name in ["main", "master"] {
+        if repo
+            .find_reference(format!("refs/heads/{name}").as_str())
+            .is_ok()
+        {
+            return Ok(name.to_owned());
         }
     }
 
     Err(Error::NoDefaultBranch)
 }
 
+/// Resolve a selected branch name to its tip commit, preferring the local
+/// branch so clean, unpushed commits remain calculable.
+fn resolve_branch_tip(repo: &gix::Repository, name: &str, remote: &str) -> Result<ObjectId, Error> {
+    try_resolve_ref(repo, &format!("refs/heads/{name}"))
+        .or_else(|| try_resolve_ref(repo, &format!("refs/remotes/{remote}/{name}")))
+        .ok_or(Error::NoDefaultBranch)
+}
+
+/// Resolve a ref to its direct target object ID, purely by reading the ref
+/// (following any symbolic indirection), without loading or peeling the
+/// target object itself. Branch refs always point directly at a commit, so
+/// this never needs object-store access -- unlike `peel_to_id`, which reads
+/// the target object to check whether it is a tag needing further peeling,
+/// and so would misreport a resolvable ref as unresolvable if that object
+/// happened to be locally missing.
 fn try_resolve_ref(repo: &gix::Repository, ref_name: &str) -> Option<ObjectId> {
     repo.find_reference(ref_name)
         .ok()?
-        .peel_to_id()
-        .ok()
+        .try_id()
         .map(gix::Id::detach)
-}
-
-enum BranchRelation {
-    OnBranch,
-    OffBranch { merge_base: ObjectId },
-}
-
-fn branch_relation(
-    repo: &gix::Repository,
-    target: ObjectId,
-    branch: &BranchInfo,
-    is_head: bool,
-) -> Result<BranchRelation, Box<dyn std::error::Error + Send + Sync>> {
-    if is_head && let Ok(Some(head_ref)) = repo.head_ref() {
-        let head_name = head_ref.name().to_string();
-        if head_name == format!("refs/heads/{}", branch.name) {
-            return Ok(BranchRelation::OnBranch);
-        }
-    }
-
-    if target == branch.hash {
-        return Ok(BranchRelation::OnBranch);
-    }
-
-    let base = repo.merge_base(target, branch.hash)?;
-    if base == target {
-        Ok(BranchRelation::OnBranch)
-    } else {
-        Ok(BranchRelation::OffBranch {
-            merge_base: base.into(),
-        })
-    }
 }
 
 /// Check if workspace is dirty, including untracked non-gitignored files.
@@ -368,11 +579,11 @@ fn check_dirty(repo: &gix::Repository) -> Result<bool, Error> {
     Ok(false)
 }
 
-fn short_hash(repo: &gix::Repository, id: ObjectId) -> String {
-    match id.attach(repo).shorten() {
-        Ok(prefix) => prefix.to_string(),
-        Err(_) => id.to_string()[..7].to_owned(),
-    }
+/// The dirty hash is always the literal first seven characters of the full
+/// object ID. Spec: "MUST NOT use git's repository-dependent abbreviation
+/// machinery" (which `core.abbrev` and ambiguity-based shortening are).
+fn short_hash(id: ObjectId) -> String {
+    id.to_string()[..7].to_owned()
 }
 
 fn epoch_to_date(seconds: gix::date::SecondsSinceUnixEpoch) -> Result<String, Error> {
@@ -531,769 +742,4 @@ pub fn patch_manifest(toml_src: &str, version: &str) -> Result<String, PatchErro
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::Command;
-
-    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    fn commit_at(dir: &std::path::Path, date: &str) -> String {
-        let output = Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "test"])
-            .current_dir(dir)
-            .env("GIT_AUTHOR_DATE", date)
-            .env("GIT_COMMITTER_DATE", date)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test.com")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        git_in(dir, &["rev-parse", "HEAD"])
-    }
-
-    fn new_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        git_in(dir.path(), &["init", "-b", "main"]);
-        dir
-    }
-
-    // Pure function tests
-
-    #[test]
-    fn looks_like_date_valid() {
-        assert!(looks_like_date("19700101"));
-        assert!(looks_like_date("20260412"));
-        assert!(looks_like_date("20001231"));
-    }
-
-    #[test]
-    fn looks_like_date_invalid() {
-        assert!(!looks_like_date("19691231"));
-        assert!(!looks_like_date("20261301"));
-        assert!(!looks_like_date("20260032"));
-        assert!(!looks_like_date("20260000"));
-        assert!(!looks_like_date("00000101"));
-        assert!(!looks_like_date("abcdefgh"));
-    }
-
-    #[test]
-    fn epoch_to_date_known_values() {
-        assert_eq!(epoch_to_date(0).unwrap(), "19700101");
-        assert_eq!(epoch_to_date(1_000_000_000).unwrap(), "20010909");
-        assert_eq!(epoch_to_date(86399).unwrap(), "19700101");
-        assert_eq!(epoch_to_date(86400).unwrap(), "19700102");
-    }
-
-    #[test]
-    fn epoch_to_date_out_of_range() {
-        assert!(matches!(
-            epoch_to_date(i64::MAX).unwrap_err(),
-            Error::Git(_)
-        ));
-    }
-
-    #[test]
-    fn parse_version_bare() {
-        assert_eq!(parse_version("20260412.1"), Some(("20260412", 1)));
-        assert_eq!(parse_version("20260412.42"), Some(("20260412", 42)));
-    }
-
-    #[test]
-    fn parse_version_prefixed() {
-        assert_eq!(parse_version("v0.20260412.3"), Some(("20260412", 3)));
-        assert_eq!(parse_version("0.20260412.1"), Some(("20260412", 1)));
-    }
-
-    #[test]
-    fn parse_version_rejects_invalid() {
-        assert_eq!(parse_version(""), None);
-        assert_eq!(parse_version("notaversion"), None);
-        assert_eq!(parse_version("20260412.0"), None);
-        assert_eq!(parse_version("20260412"), None);
-        assert_eq!(parse_version("1234567.1"), None);
-    }
-
-    #[test]
-    fn parse_version_non_digit_after_dot() {
-        assert_eq!(parse_version("20260412.abc"), None);
-    }
-
-    #[test]
-    fn parse_version_trailing_content() {
-        assert_eq!(
-            parse_version("20260412.5-dirty.abc1234"),
-            Some(("20260412", 5)),
-        );
-    }
-
-    #[test]
-    fn parse_version_non_ascii_does_not_panic() {
-        // Multi-byte UTF-8 bytes must not cause a slicing panic, whether they
-        // precede, follow, or fall inside the candidate date window.
-        assert_eq!(parse_version("日20260412.7"), Some(("20260412", 7)));
-        assert_eq!(parse_version("café20260412.1"), Some(("20260412", 1)));
-        assert_eq!(parse_version("20260412.1é"), Some(("20260412", 1)));
-        assert_eq!(parse_version("1234567日8.1"), None);
-        assert_eq!(parse_version("é"), None);
-    }
-
-    #[test]
-    fn parse_version_overflow_rejected() {
-        // usize::MAX + 1 must not overflow-panic; it is simply not a version.
-        assert_eq!(parse_version("20260412.18446744073709551616"), None);
-    }
-
-    #[test]
-    fn format_version_clean() {
-        assert_eq!(
-            format_version("", "20260412", 1, false, "", ""),
-            "20260412.1"
-        );
-        assert_eq!(
-            format_version("v0.", "20260412", 3, false, "", ""),
-            "v0.20260412.3"
-        );
-    }
-
-    #[test]
-    fn format_version_dirty_with_hash() {
-        assert_eq!(
-            format_version("", "20260412", 1, true, "-dirty", "abc1234"),
-            "20260412.1-dirty.abc1234",
-        );
-    }
-
-    #[test]
-    fn format_version_dirty_no_hash() {
-        assert_eq!(
-            format_version("", "20260412", 1, true, "-dirty", ""),
-            "20260412.1-dirty",
-        );
-    }
-
-    #[test]
-    fn options_default() {
-        let opts = Options::default();
-        assert_eq!(opts.dir, std::path::Path::new("."));
-        assert!(opts.target.is_none());
-        assert_eq!(opts.prefix, "");
-        assert!(opts.dirty_suffix.is_none());
-        assert!(opts.include_dirty_hash);
-        assert!(opts.branch.is_none());
-        assert!(!opts.short);
-    }
-
-    // Git-dependent tests
-
-    #[test]
-    fn forward_basic() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn branch_override_not_found() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("nonexistent"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::NoDefaultBranch));
-    }
-
-    #[test]
-    fn no_default_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        git_in(dir.path(), &["init", "-b", "develop"]);
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::NoDefaultBranch));
-    }
-
-    #[test]
-    fn origin_head_detection() {
-        let remote = new_repo();
-        commit_at(remote.path(), "2026-04-10T12:00:00Z");
-
-        let parent = tempfile::tempdir().unwrap();
-        git_in(
-            parent.path(),
-            &["clone", remote.path().to_str().unwrap(), "local"],
-        );
-        let local = parent.path().join("local");
-        commit_at(&local, "2026-04-10T13:00:00Z");
-
-        let result = run(&Options {
-            dir: &local,
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.2");
-    }
-
-    #[test]
-    fn corrupt_commit_propagates_error() {
-        let dir = new_repo();
-        let first = commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-
-        let obj_path = dir
-            .path()
-            .join(".git/objects")
-            .join(&first[..2])
-            .join(&first[2..]);
-        std::fs::remove_file(obj_path).unwrap();
-
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::Git(_)));
-    }
-
-    #[test]
-    fn short_hash_fallback() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let repo = gix::discover(dir.path()).unwrap();
-
-        let bogus = gix::ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
-        let result = short_hash(&repo, bogus);
-        assert_eq!(result, "deadbee");
-    }
-
-    #[test]
-    fn forward_auto_detect_branch() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn forward_multiple_same_day() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.2");
-    }
-
-    #[test]
-    fn forward_across_days() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-09T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn forward_specific_revision() {
-        let dir = new_repo();
-        let first = commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some(&first),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn forward_wrong_branch() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &["checkout", "-b", "feature"]);
-        let feature_hash = commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        git_in(dir.path(), &["checkout", "main"]);
-        let err = run(&Options {
-            dir: dir.path(),
-            target: Some(&feature_hash),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::NotOnDefaultBranch { .. }));
-    }
-
-    #[test]
-    fn off_branch_dirty_version() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &["checkout", "-b", "feature"]);
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        git_in(dir.path(), &["checkout", "main"]);
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("feature"),
-            branch: Some("main"),
-            dirty_suffix: Some("-dirty"),
-            ..Options::default()
-        })
-        .unwrap();
-        // Version is from the merge-base (main tip = 20260410.1),
-        // hash is from the feature branch commit.
-        assert!(result.starts_with("20260410.1-dirty."));
-    }
-
-    #[test]
-    fn off_branch_dirty_no_hash() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &["checkout", "-b", "feature"]);
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        git_in(dir.path(), &["checkout", "main"]);
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("feature"),
-            branch: Some("main"),
-            dirty_suffix: Some("-dirty"),
-            include_dirty_hash: false,
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1-dirty");
-    }
-
-    #[test]
-    fn forward_dirty_untracked() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        std::fs::write(dir.path().join("untracked.txt"), "dirty").unwrap();
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::DirtyWorkspace));
-    }
-
-    #[test]
-    fn forward_dirty_staged() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        std::fs::write(dir.path().join("staged.txt"), "staged").unwrap();
-        git_in(dir.path(), &["add", "staged.txt"]);
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::DirtyWorkspace));
-    }
-
-    #[test]
-    fn forward_dirty_with_suffix() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        std::fs::write(dir.path().join("dirty.txt"), "dirty").unwrap();
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            dirty_suffix: Some("-dirty"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert!(result.starts_with("20260410.1-dirty."));
-    }
-
-    #[test]
-    fn forward_dirty_no_hash() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        std::fs::write(dir.path().join("dirty.txt"), "dirty").unwrap();
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            dirty_suffix: Some("-dirty"),
-            include_dirty_hash: false,
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1-dirty");
-    }
-
-    #[test]
-    fn reverse_basic() {
-        let dir = new_repo();
-        let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("20260410.1"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, hash);
-    }
-
-    #[test]
-    fn reverse_short() {
-        let dir = new_repo();
-        let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("20260410.1"),
-            branch: Some("main"),
-            short: true,
-            ..Options::default()
-        })
-        .unwrap();
-        assert!(hash.starts_with(&result));
-    }
-
-    #[test]
-    fn reverse_multiple_same_day() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let second = commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("20260410.2"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, second);
-    }
-
-    #[test]
-    fn reverse_across_days() {
-        let dir = new_repo();
-        let first = commit_at(dir.path(), "2026-04-09T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("20260409.1"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, first);
-    }
-
-    #[test]
-    fn reverse_not_found() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            target: Some("20260410.99"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::VersionNotFound(_)));
-    }
-
-    #[test]
-    fn forward_target_is_branch_tip() {
-        let dir = new_repo();
-        let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some(&hash),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn decreasing_dates() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-11T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::DecreasingDate { .. }));
-    }
-
-    #[test]
-    fn reverse_walks_past_date() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-08T12:00:00Z");
-        let target = commit_at(dir.path(), "2026-04-09T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            target: Some("20260409.1"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, target);
-    }
-
-    #[test]
-    fn origin_head_dangling() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(
-            dir.path(),
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/nonexistent",
-            ],
-        );
-        let result = run(&Options {
-            dir: dir.path(),
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1");
-    }
-
-    #[test]
-    fn not_a_repository() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = run(&Options {
-            dir: dir.path(),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::NotARepository));
-    }
-
-    #[test]
-    fn empty_repository() {
-        let dir = new_repo();
-        let err = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::EmptyRepository));
-    }
-
-    #[test]
-    fn invalid_revision() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            target: Some("nonexistent_ref"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::RevisionNotFound(_)));
-    }
-
-    #[test]
-    fn not_traceable_unrelated_history() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &["checkout", "--orphan", "orphan"]);
-        let orphan_hash = commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            target: Some(&orphan_hash),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::NotTraceable { .. }));
-    }
-
-    #[test]
-    fn head_on_different_branch() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        git_in(dir.path(), &["checkout", "-b", "feature"]);
-        commit_at(dir.path(), "2026-04-10T13:00:00Z");
-        let result = run(&Options {
-            dir: dir.path(),
-            branch: Some("main"),
-            dirty_suffix: Some("-dirty"),
-            include_dirty_hash: false,
-            ..Options::default()
-        })
-        .unwrap();
-        assert_eq!(result, "20260410.1-dirty");
-    }
-
-    #[test]
-    fn reverse_decreasing_dates() {
-        let dir = new_repo();
-        commit_at(dir.path(), "2026-04-11T12:00:00Z");
-        commit_at(dir.path(), "2026-04-10T12:00:00Z");
-        let err = run(&Options {
-            dir: dir.path(),
-            target: Some("20260409.1"),
-            branch: Some("main"),
-            ..Options::default()
-        })
-        .unwrap_err();
-        assert!(matches!(err, Error::DecreasingDate { .. }));
-    }
-
-    // patch_manifest tests
-
-    const SRC_WITH_COMMENT: &str = "\
-[package]
-# Load-bearing comment that must survive round-trip.
-name = \"demo\"
-edition = \"2024\"
-";
-
-    #[test]
-    fn patch_inserts_version_and_publish() {
-        let out = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
-        assert!(out.contains("# Load-bearing comment"));
-        assert!(out.contains("version = \"0.20260518.1\""));
-        assert!(out.contains("publish = true"));
-    }
-
-    #[test]
-    fn patch_preserves_trailing_newline() {
-        let out = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
-        assert!(out.ends_with('\n'));
-    }
-
-    #[test]
-    fn patch_idempotent_on_matching_version() {
-        let once = patch_manifest(SRC_WITH_COMMENT, "0.20260518.1").unwrap();
-        let twice = patch_manifest(&once, "0.20260518.1").unwrap();
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn patch_rejects_mismatched_version() {
-        let src = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
-        let err = patch_manifest(src, "0.2.0").unwrap_err();
-        assert!(matches!(
-            err,
-            PatchError::VersionMismatch { ref existing, ref computed }
-                if existing == "0.1.0" && computed == "0.2.0"
-        ));
-    }
-
-    #[test]
-    fn patch_rejects_publish_false() {
-        let src = "[package]\nname = \"demo\"\npublish = false\n";
-        let err = patch_manifest(src, "0.1.0").unwrap_err();
-        assert!(matches!(err, PatchError::PublishFalse));
-    }
-
-    #[test]
-    fn patch_accepts_publish_true() {
-        let src = "[package]\nname = \"demo\"\npublish = true\n";
-        let out = patch_manifest(src, "0.1.0").unwrap();
-        assert!(out.contains("version = \"0.1.0\""));
-        assert!(out.matches("publish = true").count() == 1);
-    }
-
-    #[test]
-    fn patch_accepts_publish_registry_list() {
-        let src = "[package]\nname = \"demo\"\npublish = [\"my-registry\"]\n";
-        let out = patch_manifest(src, "0.1.0").unwrap();
-        assert!(out.contains("version = \"0.1.0\""));
-        assert!(out.contains("publish = [\"my-registry\"]"));
-    }
-
-    #[test]
-    fn patch_rejects_missing_package() {
-        let src = "[dependencies]\nfoo = \"1\"\n";
-        let err = patch_manifest(src, "0.1.0").unwrap_err();
-        assert!(matches!(err, PatchError::MissingPackage));
-    }
-
-    #[test]
-    fn patch_rejects_workspace_version_inheritance() {
-        let src = "[package]\nname = \"demo\"\nversion.workspace = true\n";
-        let err = patch_manifest(src, "0.1.0").unwrap_err();
-        assert!(matches!(err, PatchError::WorkspaceInheritance));
-    }
-
-    #[test]
-    fn patch_rejects_workspace_publish_inheritance() {
-        let src = "[package]\nname = \"demo\"\npublish.workspace = true\n";
-        let err = patch_manifest(src, "0.1.0").unwrap_err();
-        assert!(matches!(err, PatchError::WorkspaceInheritance));
-    }
-
-    #[test]
-    fn patch_rejects_malformed_toml() {
-        let src = "[package\nname = \"demo\"\n";
-        let err = patch_manifest(src, "0.1.0").unwrap_err();
-        assert!(matches!(err, PatchError::Parse(_)));
-    }
-
-    #[test]
-    fn patch_error_display() {
-        assert_eq!(
-            PatchError::MissingPackage.to_string(),
-            "manifest has no `[package]` section"
-        );
-        assert_eq!(
-            PatchError::WorkspaceInheritance.to_string(),
-            "workspace version inheritance not supported; set version in package manifest"
-        );
-        assert_eq!(
-            PatchError::PublishFalse.to_string(),
-            "manifest sets `publish = false`; refusing to overwrite"
-        );
-        let mismatch = PatchError::VersionMismatch {
-            existing: "0.1.0".into(),
-            computed: "0.2.0".into(),
-        };
-        assert!(mismatch.to_string().contains("0.1.0"));
-        assert!(mismatch.to_string().contains("0.2.0"));
-        let parse_err = patch_manifest("[package\n", "0.1.0").unwrap_err();
-        assert!(parse_err.to_string().starts_with("invalid TOML:"));
-    }
-}
+mod tests;
