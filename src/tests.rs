@@ -891,6 +891,34 @@ fn diverged_branch_anchor() {
     assert!(result.starts_with("20260410.1-dirty."));
 }
 
+#[test]
+fn off_chain_target_with_diamond_ancestry_reaches_anchor() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z"); // root, main's only commit
+    git_in(dir.path(), &["checkout", "-b", "left"]);
+    commit_at(dir.path(), "2026-04-10T10:00:00Z"); // shared ancestor
+    git_in(dir.path(), &["checkout", "-b", "right"]);
+    commit_at(dir.path(), "2026-04-10T11:00:00Z");
+    git_in(dir.path(), &["checkout", "left"]);
+    commit_at(dir.path(), "2026-04-10T11:30:00Z");
+    let target = merge_at(dir.path(), "right", "2026-04-10T12:00:00Z", "merge right");
+    // Equal arm times would make identical commits and `merge` a no-op.
+    git_in(
+        dir.path(),
+        &["rev-parse", "--verify", &format!("{target}^2")],
+    );
+
+    let result = run(&Options {
+        dir: dir.path(),
+        target: Some(&target),
+        branch: Some("main"),
+        dirty_suffix: Some("-dirty"),
+        ..Options::default()
+    })
+    .unwrap();
+    assert_eq!(result, format!("20260410.1-dirty.{}", &target[..7]));
+}
+
 // --- Bare repositories ---
 
 fn bare_clone_of(src: &std::path::Path) -> tempfile::TempDir {
