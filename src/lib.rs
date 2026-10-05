@@ -4,6 +4,7 @@ use gix::ObjectId;
 use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("workspace is dirty (use --dirty to produce a dirty version)")]
     DirtyWorkspace,
@@ -25,6 +26,9 @@ pub enum Error {
 
     #[error("not a git repository")]
     NotARepository,
+
+    #[error("not a git repository: {} is not a valid gitfile", .0.display())]
+    InvalidGitFile(std::path::PathBuf),
 
     #[error("unsupported object format {0}: only SHA-1 and SHA-256 repositories are supported")]
     UnsupportedObjectFormat(String),
@@ -94,6 +98,9 @@ impl Default for Options<'_> {
 ///
 /// Version dates are always UTC, regardless of the committer's timezone offset.
 ///
+/// The repository is located as git locates it, so `GIT_DIR`,
+/// `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM` apply.
+///
 /// # Errors
 ///
 /// Returns `Error` if the directory is not a git repository, the workspace is
@@ -151,10 +158,15 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
     trust_map.full = trust_map.full.config_overrides(NO_REPLACE_OVERRIDES);
     trust_map.reduced = trust_map.reduced.config_overrides(NO_REPLACE_OVERRIDES);
 
-    gix::ThreadSafeRepository::discover_opts(
-        dir,
-        gix::discover::upwards::Options::default(),
-        trust_map,
+    // As in git, a ceiling directory that does not contain the start directory
+    // is ignored rather than an error.
+    let options = gix::discover::upwards::Options {
+        match_ceiling_dir_or_error: false,
+        ..Default::default()
+    };
+
+    let repo = gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
+        dir, options, trust_map,
     )
     .map(|repo| repo.to_thread_local())
     .map_err(|e| {
@@ -171,14 +183,66 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
             ))) if key == "extensions.objectFormat" => {
                 Error::UnsupportedObjectFormat(value.to_string())
             }
-            Discover::Discover(
+            Discover::Open(gix::open::Error::NotARepository { .. })
+            | Discover::Discover(
                 Upwards::NoGitRepository { .. }
                 | Upwards::NoGitRepositoryWithinCeiling { .. }
                 | Upwards::NoGitRepositoryWithinFs { .. },
             ) => Error::NotARepository,
             other => git_err(other),
         }
-    })
+    })?;
+    // A repository named by `GIT_DIR` involved no discovery. An empty value
+    // still counts: git fails on it rather than discovering.
+    if std::env::var_os("GIT_DIR").is_none() {
+        let ceilings = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        check_discovery(dir, &repo, ceilings.as_deref())?;
+    }
+    Ok(repo)
+}
+
+/// Make discovery agree with git where gix does not. gix steps over a `.git`
+/// file it cannot follow and keeps climbing, where git stops and reports that
+/// directory as not a repository; an unusable `.git` directory is stepped over
+/// by both. gix also searches a `GIT_CEILING_DIRECTORIES` entry itself and
+/// never resolves symlinks in the entries, while git stops before examining a
+/// ceiling directory (its search returns at the ceiling, whatever the
+/// documentation implies) and ignores an entry equal to the start directory.
+fn check_discovery(
+    dir: &std::path::Path,
+    repo: &gix::Repository,
+    ceiling_dirs: Option<&std::ffi::OsStr>,
+) -> Result<(), Error> {
+    let mut roots = vec![std::fs::canonicalize(repo.git_dir()).map_err(git_err)?];
+    if let Some(workdir) = repo.workdir() {
+        roots.push(std::fs::canonicalize(workdir).map_err(git_err)?);
+    }
+    // Like git, ignore entries that are relative or cannot be resolved.
+    let ceilings: Vec<_> = ceiling_dirs
+        .into_iter()
+        .flat_map(|dirs| std::env::split_paths(dirs))
+        .filter(|entry| entry.is_absolute())
+        .filter_map(|entry| std::fs::canonicalize(entry).ok())
+        .collect();
+
+    let start = std::fs::canonicalize(dir).map_err(git_err)?;
+    let mut skipped = None;
+    for ancestor in start.ancestors() {
+        if ancestor != start && ceilings.iter().any(|ceiling| ceiling == ancestor) {
+            return Err(Error::NotARepository);
+        }
+        if roots.iter().any(|root| root == ancestor) {
+            return skipped.map_or(Ok(()), |path| Err(Error::InvalidGitFile(path)));
+        }
+        let candidate = ancestor.join(".git");
+        if skipped.is_none() && std::fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+            skipped = Some(candidate);
+        }
+    }
+    // No ancestor is the repository root when its work tree is configured
+    // elsewhere or a gitfile names another repository, so a skipped file proves
+    // nothing there.
+    Ok(())
 }
 
 fn graft_file_path(repo: &gix::Repository) -> std::path::PathBuf {

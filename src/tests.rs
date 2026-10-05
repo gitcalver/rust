@@ -1095,6 +1095,142 @@ fn repository_open_failure_surfaces_its_cause() {
 }
 
 #[test]
+fn unusable_gitfile_below_a_repository_stops_discovery() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    for (name, contents) in [
+        ("garbage", "garbage\n"),
+        ("dangling", "gitdir: /nonexistent/gitdir\n"),
+    ] {
+        let sub = dir.path().join(name);
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join(".git"), contents).unwrap();
+        let err = run(&Options {
+            dir: &sub,
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidGitFile(path) if path.ends_with(format!("{name}/.git"))),
+            "{name}: {err}"
+        );
+        assert!(err.to_string().ends_with(" is not a valid gitfile"));
+    }
+}
+
+#[test]
+fn unusable_dot_git_directory_is_stepped_over() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(sub.join(".git")).unwrap();
+    assert_eq!(run_target(&sub, "HEAD").unwrap(), "20260410.1");
+}
+
+#[test]
+fn gitfile_to_another_repository_is_followed() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let other = new_repo();
+    commit_at(other.path(), "2026-04-11T12:00:00Z");
+    commit_at(other.path(), "2026-04-11T13:00:00Z");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(
+        sub.join(".git"),
+        format!("gitdir: {}\n", other.path().join(".git").display()),
+    )
+    .unwrap();
+    assert_eq!(run_target(&sub, "HEAD").unwrap(), "20260411.2");
+}
+
+#[test]
+fn repository_with_its_work_tree_elsewhere_is_found() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let work_tree = tempfile::tempdir().unwrap();
+    git_in(
+        dir.path(),
+        &[
+            "config",
+            "core.worktree",
+            work_tree.path().to_str().unwrap(),
+        ],
+    );
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    assert_eq!(run_target(&sub, "HEAD").unwrap(), "20260410.1");
+}
+
+fn ceiling_check(start: &std::path::Path, ceilings: Option<&std::ffi::OsStr>) -> Result<(), Error> {
+    let repo = open_repo(start).unwrap();
+    check_discovery(start, &repo, ceilings)
+}
+
+#[test]
+fn ceiling_directory_is_never_searched() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let repo = dir.path().canonicalize().unwrap();
+    let nested = repo.join("deep/er");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    assert!(matches!(
+        ceiling_check(&nested, Some(repo.as_os_str())),
+        Err(Error::NotARepository)
+    ));
+    let list = std::env::join_paths(["/nonexistent", repo.to_str().unwrap()]).unwrap();
+    assert!(matches!(
+        ceiling_check(&nested, Some(&list)),
+        Err(Error::NotARepository)
+    ));
+
+    ceiling_check(&nested, Some(repo.parent().unwrap().as_os_str())).unwrap();
+    // An entry equal to the start directory is not an ancestor of it.
+    ceiling_check(&nested, Some(nested.as_os_str())).unwrap();
+    ceiling_check(&nested, Some("/nonexistent".as_ref())).unwrap();
+    ceiling_check(&nested, None).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_ceiling_entries_are_ignored() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let repo = dir.path().canonicalize().unwrap();
+    let nested = repo.join("sub");
+    std::fs::create_dir(&nested).unwrap();
+
+    // Relative to this process's directory, this resolves to the repository.
+    let depth = std::env::current_dir().unwrap().components().count() - 1;
+    let relative = format!(
+        "{}{}",
+        "../".repeat(depth),
+        repo.strip_prefix("/").unwrap().display()
+    );
+    ceiling_check(&nested, Some(relative.as_ref())).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ceiling_directory_symlinks_are_resolved() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let repo = dir.path().canonicalize().unwrap();
+    let nested = repo.join("sub");
+    std::fs::create_dir(&nested).unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("link");
+    std::os::unix::fs::symlink(&repo, &link).unwrap();
+
+    assert!(matches!(
+        ceiling_check(&nested, Some(link.as_os_str())),
+        Err(Error::NotARepository)
+    ));
+}
+
+#[test]
 fn git_error_message_includes_its_sources() {
     #[derive(Debug, thiserror::Error)]
     #[error("outer")]

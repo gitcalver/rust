@@ -67,6 +67,11 @@ hash, or an annotated tag. An explicitly empty target (`gitcalver ""`) is an
 error, not an omitted one. Bare repositories support explicit revisions,
 reverse lookup, and an omitted target without attempting a workspace check.
 
+The repository is found as git finds it, searching upward from the current
+directory and honoring `GIT_DIR`, `GIT_CEILING_DIRECTORIES` and
+`GIT_DISCOVERY_ACROSS_FILESYSTEM`. A `.git` file that cannot be followed ends
+the search with an error instead of falling through to an enclosing repository.
+
 ### Version prefix
 
 Use `--prefix` to prepend a string to the version number, e.g.:
