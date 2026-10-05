@@ -1023,24 +1023,63 @@ fn detached_head_is_resolved() {
 }
 
 #[test]
-fn sha256_repository_is_reported_as_unsupported() {
+fn unknown_object_format_is_reported_as_unsupported() {
+    let dir = new_repo();
+    git_in(dir.path(), &["config", "core.repositoryformatversion", "1"]);
+    git_in(dir.path(), &["config", "extensions.objectformat", "sha512"]);
+
+    let err = run(&Options {
+        dir: dir.path(),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(&err, Error::UnsupportedObjectFormat(name) if name == "sha512"));
+    assert_eq!(
+        err.to_string(),
+        "unsupported object format sha512: only SHA-1 and SHA-256 repositories are supported"
+    );
+}
+
+#[test]
+fn sha256_repository_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     git_in(
         dir.path(),
         &["init", "-b", "main", "--object-format=sha256"],
     );
-    commit_at(dir.path(), "2026-04-10T12:00:00Z");
-
-    let err = run(&Options {
+    let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    assert_eq!(hash.len(), 64);
+    let opts = Options {
         dir: dir.path(),
         branch: Some("main"),
         ..Options::default()
-    })
-    .unwrap_err();
-    assert!(matches!(&err, Error::UnsupportedObjectFormat(name) if name == "sha256"));
+    };
+    assert_eq!(run(&opts).unwrap(), "20260410.1");
     assert_eq!(
-        err.to_string(),
-        "unsupported object format sha256: only SHA-1 repositories are supported"
+        run(&Options {
+            target: Some("20260410.1"),
+            ..opts
+        })
+        .unwrap(),
+        hash
+    );
+    assert_eq!(
+        run(&Options {
+            target: Some("20260410.1"),
+            short: true,
+            ..opts
+        })
+        .unwrap(),
+        hash[..7]
+    );
+    std::fs::write(dir.path().join("untracked"), "x").unwrap();
+    assert_eq!(
+        run(&Options {
+            dirty_suffix: Some("-dirty"),
+            ..opts
+        })
+        .unwrap(),
+        format!("20260410.1-dirty.{}", &hash[..7])
     );
 }
 
@@ -1566,6 +1605,121 @@ fn packed_repository_round_trip() {
         .unwrap(),
         hash
     );
+}
+
+#[test]
+fn abbreviated_revisions_in_both_object_formats() {
+    for algorithm in ["sha1", "sha256"] {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(
+            dir.path(),
+            &[
+                "init",
+                "-b",
+                "main",
+                &format!("--object-format={algorithm}"),
+            ],
+        );
+        let first = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        let second = commit_at(dir.path(), "2026-04-10T13:00:00Z");
+        let opts = Options {
+            dir: dir.path(),
+            branch: Some("main"),
+            ..Options::default()
+        };
+        for packed in [false, true] {
+            if packed {
+                git_in(dir.path(), &["repack", "-ad"]);
+                git_in(dir.path(), &["prune-packed"]);
+            }
+            for target in [
+                first[..7].to_owned(),
+                first[..7].to_ascii_uppercase(),
+                format!("{}~1", &second[..7]),
+                format!("{}^", &second[..7]),
+            ] {
+                assert_eq!(
+                    run(&Options {
+                        target: Some(&target),
+                        ..opts
+                    })
+                    .unwrap(),
+                    "20260410.1",
+                    "{algorithm} {target}"
+                );
+            }
+        }
+        git_in(dir.path(), &["tag", "--no-sign", &first[..7], &second]);
+        assert_eq!(
+            run(&Options {
+                target: Some(&first[..7]),
+                ..opts
+            })
+            .unwrap(),
+            "20260410.2"
+        );
+        assert!(matches!(
+            run(&Options {
+                target: Some("0000000"),
+                ..opts
+            }),
+            Err(Error::RevisionNotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn hex_prefixed_ref_names_resolve_in_both_object_formats() {
+    for algorithm in ["sha1", "sha256"] {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(
+            dir.path(),
+            &[
+                "init",
+                "-b",
+                "main",
+                &format!("--object-format={algorithm}"),
+            ],
+        );
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        git_in(dir.path(), &["branch", "cafe@work"]);
+        assert_eq!(
+            run_target(dir.path(), "cafe@work").unwrap(),
+            "20260410.1",
+            "{algorithm}"
+        );
+    }
+}
+
+#[test]
+fn object_id_of_the_other_format_is_not_a_revision() {
+    for (algorithm, other_len) in [("sha1", 64), ("sha256", 40)] {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(
+            dir.path(),
+            &[
+                "init",
+                "-b",
+                "main",
+                &format!("--object-format={algorithm}"),
+            ],
+        );
+        let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        let foreign = "ab".repeat(other_len / 2);
+        let err = run_target(dir.path(), &foreign).unwrap_err();
+        assert!(matches!(err, Error::RevisionNotFound(_)), "{algorithm}");
+
+        // A ref named like such an ID is still an ordinary ref.
+        git_in(
+            dir.path(),
+            &["update-ref", &format!("refs/tags/{foreign}"), &hash],
+        );
+        assert_eq!(
+            run_target(dir.path(), &foreign).unwrap(),
+            "20260410.1",
+            "{algorithm}"
+        );
+    }
 }
 
 #[test]

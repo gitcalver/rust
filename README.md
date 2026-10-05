@@ -19,6 +19,19 @@ for a skipped value reports "version not found".
 
 See the [GitCalVer specification](https://gitcalver.org) for full details.
 
+## Repository formats
+
+| Object format | Supported |
+| ------------- | --------- |
+| SHA-1         | Yes       |
+| SHA-256       | Yes       |
+
+Both formats are enabled in the same build. Full reverse lookups return the
+repository's complete object ID: 40 characters for SHA-1 or 64 for SHA-256.
+Short lookups and dirty suffixes use the first seven characters. Any other
+object format is rejected with an `unsupported object format` error (exit
+code 1).
+
 ## Installation
 
 Git history is read directly using [gix](https://github.com/GitoxideLabs/gitoxide);
@@ -137,13 +150,6 @@ Missing required commits produce exit code 4, not a guessed version. Legacy
 `info/grafts` files and replacement refs are rejected and ignored,
 respectively, for the same reason: both can silently substitute ancestry that
 isn't actually present.
-
-### SHA-256 repositories
-
-Only SHA-1 repositories are supported: gix is compiled here without SHA-256
-support, so a SHA-256 repository is rejected with an
-`unsupported object format` error (exit code 1). The spec makes SHA-256 support
-optional; the `sh` implementation supports it.
 
 ## `prepare-publish`
 

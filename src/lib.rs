@@ -26,7 +26,7 @@ pub enum Error {
     #[error("not a git repository")]
     NotARepository,
 
-    #[error("unsupported object format {0}: only SHA-1 repositories are supported")]
+    #[error("unsupported object format {0}: only SHA-1 and SHA-256 repositories are supported")]
     UnsupportedObjectFormat(String),
 
     #[error("--prefix must not contain a newline")]
@@ -160,8 +160,8 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
     .map_err(|e| {
         use gix::discover::{Error as Discover, upwards::Error as Upwards};
         match e {
-            // With only the `sha1` feature built, gix rejects any other
-            // `extensions.objectFormat` as an invalid config value.
+            // gix reports an object format it was not built for as an
+            // invalid `extensions.objectFormat` config value.
             Discover::Open(gix::open::Error::Config(gix::config::Error::ConfigTypedString(
                 gix::config::key::GenericErrorWithValue {
                     key,
@@ -253,15 +253,48 @@ fn resolve_target(repo: &gix::Repository, subject: &str) -> Result<ObjectId, Err
     let id = if subject == "HEAD" {
         head_id(repo)?
     } else {
-        match repo.rev_parse_single(subject) {
+        match repo.rev_parse_single(expand_short_id(repo, subject)?.as_ref()) {
             Ok(id) => id.detach(),
             Err(_) => ObjectId::from_hex(subject.as_bytes())
                 .ok()
+                .filter(|id| id.kind() == repo.object_hash())
                 .or_else(|| try_resolve_ref(repo, subject))
                 .ok_or_else(|| Error::RevisionNotFound(subject.to_owned()))?,
         }
     };
     peel_to_commit(repo, id, subject)
+}
+
+/// gix parses a short hexadecimal ID as SHA-1 even in a SHA-256 repository, so
+/// there the leading hex run is expanded to a full ID before parsing. A ref of
+/// that name still wins, as in git. Only `^`, `~` and `:` can follow an object
+/// ID, and none of them is legal in a ref name; `@` is, so a name such as
+/// `cafe@work` is left to the parser.
+fn expand_short_id<'a>(
+    repo: &gix::Repository,
+    rev: &'a str,
+) -> Result<std::borrow::Cow<'a, str>, Error> {
+    if repo.object_hash() != gix::hash::Kind::Sha256 {
+        return Ok(std::borrow::Cow::Borrowed(rev));
+    }
+
+    let hex_len = rev.bytes().take_while(u8::is_ascii_hexdigit).count();
+    let (hex, suffix) = rev.split_at(hex_len);
+    let hash_len = repo.object_hash().len_in_hex();
+    if !(gix::hash::Prefix::MIN_HEX_LEN..hash_len).contains(&hex_len)
+        || !(suffix.is_empty() || suffix.starts_with(['^', '~', ':']))
+        || repo.try_find_reference(hex).map_err(git_err)?.is_some()
+    {
+        return Ok(std::borrow::Cow::Borrowed(rev));
+    }
+
+    let padded = format!("{hex:0<hash_len$}");
+    let id = ObjectId::from_hex(padded.as_bytes()).expect("validated hexadecimal prefix");
+    let prefix = gix::hash::Prefix::new(&id, hex_len).expect("validated prefix length");
+    let Some(Ok(full)) = repo.objects.lookup_prefix(prefix, None).map_err(git_err)? else {
+        return Err(Error::RevisionNotFound(rev.to_owned()));
+    };
+    Ok(std::borrow::Cow::Owned(format!("{full}{suffix}")))
 }
 
 /// The object `HEAD` names. gix's `Head::id` stops at the first symbolic ref, so
