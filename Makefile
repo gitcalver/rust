@@ -1,10 +1,5 @@
 CONFORMANCE_DIR ?= ../sh
-# Pinned to sh's last 0.2 commit. `make acceptance` is expected to FAIL at
-# this pin: rust already implements the 0.3 counting rule, and the 0.2
-# suite's merge-count expectations differ by design. Nothing in CI runs this
-# target; re-pin to sh's 0.3 commit once sh/spec 0.3 land (see the 0.3
-# rollout plan), after which it must pass again.
-CONFORMANCE_SHA := a7f5c0600057d05028467cda8c65b36d5aa1eaf5
+CONFORMANCE_SHA := 857287da052d1437703ead1f7d2adc76a95451ba
 
 build:
 	cargo build --release

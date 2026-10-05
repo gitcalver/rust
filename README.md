@@ -30,7 +30,7 @@ Both formats are enabled in the same build. Full reverse lookups return the
 repository's complete object ID: 40 characters for SHA-1 or 64 for SHA-256.
 Short lookups and dirty suffixes use the first seven characters. Any other
 object format is rejected with an `unsupported object format` error (exit
-code 1).
+code 1). CI runs the unit and acceptance suites with both formats.
 
 ## Installation
 
