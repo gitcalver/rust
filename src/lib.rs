@@ -645,20 +645,11 @@ fn detect_branch_name(
         return Ok(short.to_owned());
     }
 
-    for name in ["main", "master"] {
-        if repo
-            .find_reference(format!("{remote_prefix}{name}").as_str())
-            .is_ok()
-        {
-            return Ok(name.to_owned());
-        }
-    }
-    for name in ["main", "master"] {
-        if repo
-            .find_reference(format!("refs/heads/{name}").as_str())
-            .is_ok()
-        {
-            return Ok(name.to_owned());
+    for prefix in [remote_prefix.as_str(), "refs/heads/"] {
+        for name in ["main", "master"] {
+            if try_resolve_ref(repo, &format!("{prefix}{name}")).is_some() {
+                return Ok(name.to_owned());
+            }
         }
     }
 

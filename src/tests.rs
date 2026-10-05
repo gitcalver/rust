@@ -2458,6 +2458,27 @@ fn detect_local_master_fallback() {
 }
 
 #[test]
+fn dangling_symbolic_branches_are_not_default_branch_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    git_in(dir.path(), &["init", "-b", "master"]);
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    git_in(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/master", "HEAD"],
+    );
+    for name in ["refs/heads/main", "refs/remotes/origin/main"] {
+        git_in(dir.path(), &["symbolic-ref", name, "refs/nowhere"]);
+    }
+
+    let result = run(&Options {
+        dir: dir.path(),
+        ..Options::default()
+    })
+    .unwrap();
+    assert_eq!(result, "20260410.1");
+}
+
+#[test]
 fn detect_remote_main_without_symbolic_head() {
     // A plain `remote add` + `fetch` (unlike `clone`) still creates the
     // cached remote-tracking branch, but nothing here relies on a symbolic
