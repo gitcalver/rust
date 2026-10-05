@@ -20,6 +20,7 @@ Options:
   --branch BRANCH     Override default branch detection
   --remote REMOTE     Remote used for cached branch detection (default: origin)
   --short             Output short commit hash (reverse mode only)
+  --version           Show version information
   --help              Show this help
 
 Exit codes:
@@ -72,6 +73,11 @@ fn cli(args: &[String]) -> u8 {
         }
     };
 
+    if parsed.version {
+        println!("{}", version_line(env!("CARGO_PKG_VERSION")));
+        return 0;
+    }
+
     if let Err(msg) = validate(&parsed) {
         eprintln!("gitcalver: {msg}");
         return 1;
@@ -89,6 +95,16 @@ fn cli(args: &[String]) -> u8 {
             eprintln!("gitcalver: {e}");
             code
         }
+    }
+}
+
+/// `make publish` injects `0.YYYYMMDD.N` into Cargo.toml, because Cargo needs
+/// three components; the reported version is the bare `YYYYMMDD.N`. A build
+/// from a checkout keeps Cargo's placeholder `0.0.0`.
+fn version_line(package_version: &str) -> String {
+    match package_version.strip_prefix("0.") {
+        Some(version) if version != "0.0" => format!("gitcalver {version}"),
+        _ => "gitcalver (development)".to_owned(),
     }
 }
 
@@ -278,6 +294,11 @@ const fn exit_code(err: &gitcalver::Error) -> u8 {
     }
 }
 
+#[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one bool per command-line flag"
+)]
 struct ParsedArgs {
     prefix: String,
     dirty_string: Option<String>,
@@ -286,20 +307,14 @@ struct ParsedArgs {
     branch: String,
     remote: String,
     short: bool,
-    positional: String,
+    version: bool,
+    // `Some("")` is an explicit empty target, which is not the same as no
+    // target.
+    positional: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
-    let mut parsed = ParsedArgs {
-        prefix: String::new(),
-        dirty_string: None,
-        no_dirty: false,
-        no_dirty_hash: false,
-        branch: String::new(),
-        remote: String::new(),
-        short: false,
-        positional: String::new(),
-    };
+    let mut parsed = ParsedArgs::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -348,16 +363,20 @@ fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
             "--short" => {
                 parsed.short = true;
             }
+            "--version" => {
+                parsed.version = true;
+                return Ok(Some(parsed));
+            }
             "--help" => {
                 return Ok(None);
             }
             "--" => {
                 i += 1;
                 if i < args.len() {
-                    if !parsed.positional.is_empty() {
+                    if parsed.positional.is_some() {
                         return Err(format!("unexpected argument: {}", args[i]));
                     }
-                    parsed.positional.clone_from(&args[i]);
+                    parsed.positional = Some(args[i].clone());
                     i += 1;
                 }
                 if i < args.len() {
@@ -369,10 +388,10 @@ fn parse_args(args: &[String]) -> Result<Option<ParsedArgs>, String> {
                 return Err(format!("unknown option: {arg}"));
             }
             _ => {
-                if !parsed.positional.is_empty() {
+                if parsed.positional.is_some() {
                     return Err(format!("unexpected argument: {arg}"));
                 }
-                parsed.positional.clone_from(arg);
+                parsed.positional = Some(arg.clone());
             }
         }
         i += 1;
@@ -385,9 +404,6 @@ fn validate(parsed: &ParsedArgs) -> Result<(), String> {
     if parsed.no_dirty_hash && (parsed.dirty_string.is_none() || parsed.no_dirty) {
         return Err("--no-dirty-hash requires --dirty".to_owned());
     }
-    if parsed.short && gitcalver::parse_version(&parsed.positional).is_none() {
-        return Err("--short is only valid in reverse mode (with a version argument)".to_owned());
-    }
     Ok(())
 }
 
@@ -397,12 +413,6 @@ impl ParsedArgs {
             None
         } else {
             self.dirty_string.as_deref()
-        };
-
-        let target = if self.positional.is_empty() {
-            None
-        } else {
-            Some(self.positional.as_str())
         };
 
         let branch = if self.branch.is_empty() {
@@ -419,7 +429,7 @@ impl ParsedArgs {
 
         Options {
             dir: std::path::Path::new("."),
-            target,
+            target: self.positional.as_deref(),
             prefix: &self.prefix,
             dirty_suffix,
             include_dirty_hash: !self.no_dirty_hash,
@@ -614,7 +624,7 @@ mod tests {
         let parsed = parse_args(&args(&["--", "--looks-like-flag"]))
             .unwrap()
             .unwrap();
-        assert_eq!(parsed.positional, "--looks-like-flag");
+        assert_eq!(parsed.positional.as_deref(), Some("--looks-like-flag"));
     }
 
     #[test]
@@ -638,7 +648,40 @@ mod tests {
     fn parse_double_dash_only() {
         // `--` with nothing after ends option parsing and leaves no positional.
         let parsed = parse_args(&args(&["--"])).unwrap().unwrap();
-        assert_eq!(parsed.positional, "");
+        assert_eq!(parsed.positional, None);
+    }
+
+    #[test]
+    fn parse_empty_positional_is_explicit() {
+        let parsed = parse_args(&args(&[""])).unwrap().unwrap();
+        assert_eq!(parsed.positional.as_deref(), Some(""));
+        let parsed = parse_args(&args(&["--", ""])).unwrap().unwrap();
+        assert_eq!(parsed.positional.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_empty_positional_occupies_the_slot() {
+        assert!(parse_args(&args(&["", "20260410.1"])).is_err());
+        assert!(parse_args(&args(&["", "--", "20260410.1"])).is_err());
+    }
+
+    #[test]
+    fn parse_version_flag() {
+        let parsed = parse_args(&args(&["--version"])).unwrap().unwrap();
+        assert!(parsed.version);
+    }
+
+    #[test]
+    fn parse_version_flag_ends_parsing() {
+        let parsed = parse_args(&args(&["--version", "--bogus", "a", "b"]))
+            .unwrap()
+            .unwrap();
+        assert!(parsed.version);
+        assert!(matches!(
+            parse_args(&args(&["--help", "--version"])),
+            Ok(None)
+        ));
+        assert!(parse_args(&args(&["--bogus", "--version"])).is_err());
     }
 
     #[test]
@@ -666,7 +709,7 @@ mod tests {
         assert_eq!(parsed.branch, "main");
         assert_eq!(parsed.remote, "upstream");
         assert!(parsed.short);
-        assert_eq!(parsed.positional, "abc123");
+        assert_eq!(parsed.positional.as_deref(), Some("abc123"));
     }
 
     #[test]
@@ -684,14 +727,9 @@ mod tests {
     #[test]
     fn validate_ok() {
         let parsed = ParsedArgs {
-            prefix: String::new(),
             dirty_string: Some("-dirty".into()),
-            no_dirty: false,
             no_dirty_hash: true,
-            branch: String::new(),
-            remote: String::new(),
-            short: false,
-            positional: String::new(),
+            ..ParsedArgs::default()
         };
         assert!(validate(&parsed).is_ok());
     }
@@ -699,31 +737,61 @@ mod tests {
     #[test]
     fn validate_no_dirty_hash_without_dirty() {
         let parsed = ParsedArgs {
-            prefix: String::new(),
-            dirty_string: None,
-            no_dirty: false,
             no_dirty_hash: true,
-            branch: String::new(),
-            remote: String::new(),
-            short: false,
-            positional: String::new(),
+            ..ParsedArgs::default()
         };
         assert!(validate(&parsed).is_err());
     }
 
     #[test]
-    fn validate_short_without_version() {
-        let parsed = ParsedArgs {
-            prefix: String::new(),
-            dirty_string: None,
-            no_dirty: false,
-            no_dirty_hash: false,
-            branch: String::new(),
-            remote: String::new(),
-            short: true,
-            positional: "not-a-version".into(),
-        };
-        assert!(validate(&parsed).is_err());
+    fn cli_short_without_version_exit_code() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        assert_eq!(cli_in_dir(dir.path(), &["--branch", "main", "--short"]), 1);
+        assert_eq!(
+            cli_in_dir(dir.path(), &["--branch", "main", "--short", "HEAD"]),
+            1
+        );
+    }
+
+    #[test]
+    fn cli_empty_target_exit_code() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        assert_eq!(cli_in_dir(dir.path(), &["--branch", "main", ""]), 1);
+    }
+
+    #[test]
+    fn cli_newline_prefix_exit_code() {
+        let dir = new_repo();
+        commit_at(dir.path(), "2026-04-10T12:00:00Z");
+        assert_eq!(
+            cli_in_dir(dir.path(), &["--branch", "main", "--prefix", "a\nb"]),
+            1
+        );
+    }
+
+    #[test]
+    fn cli_version() {
+        assert_eq!(cli(&args(&["--version"])), 0);
+        assert_eq!(cli(&args(&["--version", "--bogus"])), 0);
+    }
+
+    // version_line tests
+
+    #[test]
+    fn version_line_development_build() {
+        assert_eq!(version_line("0.0.0"), "gitcalver (development)");
+    }
+
+    #[test]
+    fn version_line_published_build() {
+        assert_eq!(version_line("0.20260412.3"), "gitcalver 20260412.3");
+    }
+
+    #[test]
+    fn version_line_unexpected_package_version() {
+        assert_eq!(version_line("1.2.3"), "gitcalver (development)");
     }
 
     // to_options tests
@@ -733,12 +801,12 @@ mod tests {
         let parsed = ParsedArgs {
             prefix: "v0.".into(),
             dirty_string: Some("-dirty".into()),
-            no_dirty: false,
             no_dirty_hash: true,
             branch: "main".into(),
             remote: "upstream".into(),
             short: true,
-            positional: "abc123".into(),
+            positional: Some("abc123".into()),
+            ..ParsedArgs::default()
         };
         let opts = parsed.to_options();
         assert_eq!(opts.prefix, "v0.");
@@ -753,20 +821,24 @@ mod tests {
     #[test]
     fn to_options_no_dirty_overrides() {
         let parsed = ParsedArgs {
-            prefix: String::new(),
             dirty_string: Some("-dirty".into()),
             no_dirty: true,
-            no_dirty_hash: false,
-            branch: String::new(),
-            remote: String::new(),
-            short: false,
-            positional: String::new(),
+            ..ParsedArgs::default()
         };
         let opts = parsed.to_options();
         assert!(opts.dirty_suffix.is_none());
         assert!(opts.target.is_none());
         assert!(opts.branch.is_none());
         assert!(opts.remote.is_none());
+    }
+
+    #[test]
+    fn to_options_empty_target_is_explicit() {
+        let parsed = ParsedArgs {
+            positional: Some(String::new()),
+            ..ParsedArgs::default()
+        };
+        assert_eq!(parsed.to_options().target, Some(""));
     }
 
     // exit_code tests

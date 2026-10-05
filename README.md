@@ -49,8 +49,10 @@ $ gitcalver
 
 An omitted target checks the workspace. An explicit revision, including
 `HEAD`, calculates that commit's version without considering workspace
-changes. Bare repositories support explicit revisions, reverse lookup, and an
-omitted target without attempting a workspace check.
+changes. A revision may be anything that names a commit, such as a branch, a
+hash, or an annotated tag. An explicitly empty target (`gitcalver ""`) is an
+error, not an omitted one. Bare repositories support explicit revisions,
+reverse lookup, and an omitted target without attempting a workspace check.
 
 ### Version prefix
 
@@ -89,10 +91,16 @@ $ gitcalver --short --prefix "0." 0.20260411.3
 a1b2c3d
 ```
 
-If the version was generated with `--prefix`, pass the same `--prefix` for
-reverse lookup.
+A version generated with `--prefix` must be looked up with the same
+`--prefix`, and the input must include it: a bare `20260411.3` is rejected
+when a prefix is configured. Only a complete `YYYYMMDD.N`, after the exact
+prefix is removed, is treated as a version, and it is then never read as a
+revision even when its date is invalid. Anything else, such as
+`release-20260411.3`, is a revision name.
 
 Dirty versions cannot be reversed.
+
+A prefix must not contain a newline.
 
 ### Options
 
@@ -105,6 +113,7 @@ Dirty versions cannot be reversed.
 | `--branch BRANCH`  | Override default branch detection                                  |
 | `--remote REMOTE`  | Remote used for cached branch detection (default: `origin`); never fetches |
 | `--short`          | Output first seven object-ID characters (reverse mode only)        |
+| `--version`        | Show version information                                           |
 | `--help`           | Show help                                                           |
 
 ### Exit codes
@@ -128,6 +137,13 @@ Missing required commits produce exit code 4, not a guessed version. Legacy
 `info/grafts` files and replacement refs are rejected and ignored,
 respectively, for the same reason: both can silently substitute ancestry that
 isn't actually present.
+
+### SHA-256 repositories
+
+Only SHA-1 repositories are supported: gix is compiled here without SHA-256
+support, so a SHA-256 repository is rejected with an
+`unsupported object format` error (exit code 1). The spec makes SHA-256 support
+optional; the `sh` implementation supports it.
 
 ## `prepare-publish`
 

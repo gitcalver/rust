@@ -77,20 +77,26 @@ fn file_url(path: &std::path::Path) -> String {
 // Pure function tests
 
 #[test]
-fn looks_like_date_valid() {
-    assert!(looks_like_date("19700101"));
-    assert!(looks_like_date("20260412"));
-    assert!(looks_like_date("20001231"));
+fn is_gregorian_date_valid() {
+    assert!(is_gregorian_date("19700101"));
+    assert!(is_gregorian_date("19691231"));
+    assert!(is_gregorian_date("20260412"));
+    assert!(is_gregorian_date("20001231"));
+    assert!(is_gregorian_date("20240229"));
+    assert!(is_gregorian_date("20000229"));
+    assert!(is_gregorian_date("00010101"));
+    assert!(is_gregorian_date("99991231"));
 }
 
 #[test]
-fn looks_like_date_invalid() {
-    assert!(!looks_like_date("19691231"));
-    assert!(!looks_like_date("20261301"));
-    assert!(!looks_like_date("20260032"));
-    assert!(!looks_like_date("20260000"));
-    assert!(!looks_like_date("00000101"));
-    assert!(!looks_like_date("abcdefgh"));
+fn is_gregorian_date_invalid() {
+    assert!(!is_gregorian_date("20261301"));
+    assert!(!is_gregorian_date("20260032"));
+    assert!(!is_gregorian_date("20260000"));
+    assert!(!is_gregorian_date("20260431"));
+    assert!(!is_gregorian_date("20230229"));
+    assert!(!is_gregorian_date("19000229"));
+    assert!(!is_gregorian_date("00000101"));
 }
 
 #[test]
@@ -110,54 +116,115 @@ fn epoch_to_date_out_of_range() {
 }
 
 #[test]
-fn parse_version_bare() {
-    assert_eq!(parse_version("20260412.1"), Some(("20260412", 1)));
-    assert_eq!(parse_version("20260412.42"), Some(("20260412", 42)));
-}
-
-#[test]
-fn parse_version_prefixed() {
-    assert_eq!(parse_version("v0.20260412.3"), Some(("20260412", 3)));
-    assert_eq!(parse_version("0.20260412.1"), Some(("20260412", 1)));
-}
-
-#[test]
-fn parse_version_rejects_invalid() {
-    assert_eq!(parse_version(""), None);
-    assert_eq!(parse_version("notaversion"), None);
-    assert_eq!(parse_version("20260412.0"), None);
-    assert_eq!(parse_version("20260412"), None);
-    assert_eq!(parse_version("1234567.1"), None);
-}
-
-#[test]
-fn parse_version_non_digit_after_dot() {
-    assert_eq!(parse_version("20260412.abc"), None);
-}
-
-#[test]
-fn parse_version_trailing_content() {
+fn reverse_input_bare() {
     assert_eq!(
-        parse_version("20260412.5-dirty.abc1234"),
-        Some(("20260412", 5)),
+        reverse_input("20260412.1", "").unwrap(),
+        Some(("20260412", 1))
+    );
+    assert_eq!(
+        reverse_input("20260412.42", "").unwrap(),
+        Some(("20260412", 42))
     );
 }
 
 #[test]
-fn parse_version_non_ascii_does_not_panic() {
-    // Multi-byte UTF-8 bytes must not cause a slicing panic, whether they
-    // precede, follow, or fall inside the candidate date window.
-    assert_eq!(parse_version("日20260412.7"), Some(("20260412", 7)));
-    assert_eq!(parse_version("café20260412.1"), Some(("20260412", 1)));
-    assert_eq!(parse_version("20260412.1é"), Some(("20260412", 1)));
-    assert_eq!(parse_version("1234567日8.1"), None);
-    assert_eq!(parse_version("é"), None);
+fn reverse_input_prefixed() {
+    assert_eq!(
+        reverse_input("v0.20260412.3", "v0.").unwrap(),
+        Some(("20260412", 3))
+    );
+    assert_eq!(
+        reverse_input("0.20260412.1", "0.").unwrap(),
+        Some(("20260412", 1))
+    );
 }
 
 #[test]
-fn parse_version_overflow_rejected() {
-    // usize::MAX + 1 must not overflow-panic; it is simply not a version.
-    assert_eq!(parse_version("20260412.18446744073709551616"), None);
+fn reverse_input_requires_the_configured_prefix() {
+    let err = reverse_input("20260412.1", "v0.").unwrap_err();
+    assert!(matches!(
+        &err,
+        Error::MissingPrefix { version, prefix } if version == "20260412.1" && prefix == "v0."
+    ));
+    assert_eq!(
+        err.to_string(),
+        "version 20260412.1 is missing required prefix \"v0.\""
+    );
+}
+
+#[test]
+fn reverse_input_infers_no_prefix() {
+    assert_eq!(reverse_input("v0.20260412.3", "").unwrap(), None);
+    assert_eq!(reverse_input("0.20260412.1", "").unwrap(), None);
+    assert_eq!(reverse_input("0.20260412.1", "v0.").unwrap(), None);
+}
+
+#[test]
+fn reverse_input_rejects_non_versions() {
+    for target in [
+        "",
+        "notaversion",
+        "20260412.0",
+        "20260412.01",
+        "20260412",
+        "1234567.1",
+        "20260412.abc",
+        "20260412.1.2",
+        "release-20260412.2",
+        "20260412.5-dirty.abc1234",
+        "20260412.1\n",
+        "20260412.1\n20260412.2",
+        "x\n20260412.1",
+        "abcdefgh.1",
+        "hotfix-1.2",
+        "version1.2",
+        "20260412.",
+    ] {
+        assert_eq!(reverse_input(target, "").unwrap(), None, "{target:?}");
+    }
+}
+
+#[test]
+fn reverse_input_non_ascii_does_not_panic() {
+    for target in [
+        "日20260412.7",
+        "café20260412.1",
+        "20260412.1é",
+        "1234567日8.1",
+        "aééxyz.1",
+        "é",
+    ] {
+        assert_eq!(reverse_input(target, "").unwrap(), None, "{target:?}");
+    }
+}
+
+#[test]
+fn reverse_input_invalid_date_is_still_reverse_mode() {
+    for target in ["20261301.1", "20260230.1", "20230229.1", "00000101.1"] {
+        let err = reverse_input(target, "").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidVersionDate(v) if v == target),
+            "{target:?}: {err}"
+        );
+    }
+    assert_eq!(
+        reverse_input("19691231.1", "").unwrap(),
+        Some(("19691231", 1))
+    );
+    assert_eq!(
+        reverse_input("20240229.1", "").unwrap(),
+        Some(("20240229", 1))
+    );
+}
+
+#[test]
+fn reverse_input_count_overflow() {
+    let err = reverse_input("20260412.18446744073709551616", "").unwrap_err();
+    assert!(matches!(err, Error::InvalidVersionCount(_)));
+    assert_eq!(
+        err.to_string(),
+        "invalid count in version: 20260412.18446744073709551616"
+    );
 }
 
 #[test]
@@ -701,6 +768,396 @@ fn invalid_revision() {
     assert!(matches!(err, Error::RevisionNotFound(_)));
 }
 
+// --- Target and version input handling ---
+
+fn run_target(dir: &std::path::Path, target: &str) -> Result<String, Error> {
+    run(&Options {
+        dir,
+        target: Some(target),
+        branch: Some("main"),
+        ..Options::default()
+    })
+}
+
+fn tag_annotated(dir: &std::path::Path, name: &str, object: &str) {
+    git_in(
+        dir,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@test.com",
+            "tag",
+            "--no-sign",
+            "-a",
+            "-m",
+            "annotated",
+            name,
+            object,
+        ],
+    );
+}
+
+#[test]
+fn explicit_empty_target_is_rejected() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let err = run_target(dir.path(), "").unwrap_err();
+    assert!(matches!(&err, Error::RevisionNotFound(rev) if rev.is_empty()));
+}
+
+#[test]
+fn annotated_tag_target_resolves_to_its_commit() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    tag_annotated(dir.path(), "v1", "HEAD");
+    tag_annotated(dir.path(), "v1-again", "v1");
+    let tag_object = git_in(dir.path(), &["rev-parse", "v1"]);
+
+    for target in ["v1", "v1-again", tag_object.as_str()] {
+        assert_eq!(run_target(dir.path(), target).unwrap(), "20260410.2");
+    }
+}
+
+#[test]
+fn tree_target_is_not_a_revision() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let err = run_target(dir.path(), "HEAD^{tree}").unwrap_err();
+    assert!(matches!(&err, Error::RevisionNotFound(rev) if rev == "HEAD^{tree}"));
+}
+
+#[test]
+fn tag_cycle_is_not_a_revision() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let id = "1".repeat(40);
+    let tag = format!("object {id}\ntype tag\ntag loop\ntagger T <t@t> 0 +0000\n\nloop\n");
+    std::fs::write(dir.path().join("loop.tag"), tag).unwrap();
+    let written = git_in(
+        dir.path(),
+        &["hash-object", "-w", "-t", "tag", "--literally", "loop.tag"],
+    );
+    // Stored under the ID its own header names, the tag points at itself.
+    let objects = dir.path().join(".git/objects");
+    std::fs::create_dir_all(objects.join("11")).unwrap();
+    std::fs::copy(
+        objects.join(&written[..2]).join(&written[2..]),
+        objects.join("11").join(&id[2..]),
+    )
+    .unwrap();
+
+    let err = run_target(dir.path(), &id).unwrap_err();
+    assert!(matches!(&err, Error::RevisionNotFound(rev) if *rev == id));
+}
+
+#[test]
+fn missing_head_commit_is_incomplete_history() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    let head = commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    delete_object(dir.path(), &head);
+
+    for target in [None, Some("HEAD")] {
+        let err = run(&Options {
+            dir: dir.path(),
+            target,
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::IncompleteHistory(msg) if msg.starts_with("HEAD ")),
+            "{target:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn symbolic_ref_to_missing_commit_is_incomplete_history() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    let tip = commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    delete_object(dir.path(), &tip);
+
+    let err = run_target(dir.path(), "alias").unwrap_err();
+    assert!(
+        matches!(&err, Error::IncompleteHistory(msg) if msg.starts_with("alias ")),
+        "{err}"
+    );
+}
+
+#[test]
+fn explicit_head_in_empty_repository() {
+    let dir = new_repo();
+    let err = run_target(dir.path(), "HEAD").unwrap_err();
+    assert!(matches!(err, Error::EmptyRepository));
+}
+
+#[test]
+fn missing_target_commit_is_incomplete_history() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    let missing = commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    commit_at(dir.path(), "2026-04-10T11:00:00Z");
+    tag_annotated(dir.path(), "v1", &missing);
+    delete_object(dir.path(), &missing);
+
+    for target in [missing.as_str(), "v1"] {
+        let err = run_target(dir.path(), target).unwrap_err();
+        assert!(
+            matches!(&err, Error::IncompleteHistory(msg) if msg.starts_with(target)),
+            "{target}: {err}"
+        );
+    }
+}
+
+#[test]
+fn symbolic_branch_ref_is_followed() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/trunk", "refs/heads/main"],
+    );
+
+    let result = run(&Options {
+        dir: dir.path(),
+        branch: Some("trunk"),
+        ..Options::default()
+    })
+    .unwrap();
+    assert_eq!(result, "20260410.2");
+}
+
+#[test]
+fn symbolic_ref_cycle_is_unresolvable() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/loop-a", "refs/heads/loop-b"],
+    );
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/loop-b", "refs/heads/loop-a"],
+    );
+
+    let err = run(&Options {
+        dir: dir.path(),
+        branch: Some("loop-a"),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::NoDefaultBranch));
+}
+
+#[test]
+fn head_on_symbolic_branch_alias_is_resolved() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    git_in(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+
+    for target in [None, Some("HEAD")] {
+        let result = run(&Options {
+            dir: dir.path(),
+            target,
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(result, "20260410.2", "{target:?}");
+    }
+}
+
+#[test]
+fn head_on_dangling_symbolic_branch_alias_is_empty_repository() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    git_in(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/unborn"],
+    );
+    git_in(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+
+    for target in [None, Some("HEAD")] {
+        let err = run(&Options {
+            dir: dir.path(),
+            target,
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::EmptyRepository), "{target:?}: {err}");
+    }
+}
+
+#[test]
+fn detached_head_is_resolved() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(dir.path(), &["checkout", "--detach"]);
+
+    for target in [None, Some("HEAD")] {
+        let result = run(&Options {
+            dir: dir.path(),
+            target,
+            branch: Some("main"),
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(result, "20260410.2", "{target:?}");
+    }
+}
+
+#[test]
+fn sha256_repository_is_reported_as_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    git_in(
+        dir.path(),
+        &["init", "-b", "main", "--object-format=sha256"],
+    );
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+
+    let err = run(&Options {
+        dir: dir.path(),
+        branch: Some("main"),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(&err, Error::UnsupportedObjectFormat(name) if name == "sha256"));
+    assert_eq!(
+        err.to_string(),
+        "unsupported object format sha256: only SHA-1 repositories are supported"
+    );
+}
+
+#[test]
+fn repository_open_failure_surfaces_its_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = run(&Options {
+        dir: &dir.path().join("does-not-exist"),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::Git(_)));
+}
+
+#[test]
+fn git_error_message_includes_its_sources() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer")]
+    struct Outer(#[source] std::io::Error);
+
+    let err = git_err(Outer(std::io::Error::other("inner")));
+    assert_eq!(err.to_string(), "outer: inner");
+}
+
+#[test]
+fn newline_in_prefix_is_rejected() {
+    // Rejected before the repository is even opened.
+    let dir = tempfile::tempdir().unwrap();
+    let err = run(&Options {
+        dir: dir.path(),
+        prefix: "a\nb",
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidPrefix));
+}
+
+#[test]
+fn short_requires_reverse_mode() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    for target in [None, Some("HEAD")] {
+        let err = run(&Options {
+            dir: dir.path(),
+            target,
+            branch: Some("main"),
+            short: true,
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::ShortRequiresReverse));
+    }
+}
+
+#[test]
+fn reverse_with_prefix() {
+    let dir = new_repo();
+    let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let result = run(&Options {
+        dir: dir.path(),
+        target: Some("v0.20260410.1"),
+        prefix: "v0.",
+        branch: Some("main"),
+        ..Options::default()
+    })
+    .unwrap();
+    assert_eq!(result, hash);
+}
+
+#[test]
+fn reverse_requires_configured_prefix() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let err = run(&Options {
+        dir: dir.path(),
+        target: Some("20260410.1"),
+        prefix: "v0.",
+        branch: Some("main"),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::MissingPrefix { .. }));
+}
+
+#[test]
+fn invalid_version_date_is_not_a_revision() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    git_in(dir.path(), &["tag", "--no-sign", "20261301.1"]);
+    let err = run_target(dir.path(), "20261301.1").unwrap_err();
+    assert!(matches!(err, Error::InvalidVersionDate(_)));
+}
+
+#[test]
+fn version_named_tag_does_not_shadow_reverse_lookup() {
+    let dir = new_repo();
+    let first = commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(dir.path(), &["tag", "--no-sign", "20260410.1"]);
+    assert_eq!(run_target(dir.path(), "20260410.1").unwrap(), first);
+}
+
+#[test]
+fn version_with_trailing_text_is_a_revision() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T09:00:00Z");
+    commit_at(dir.path(), "2026-04-10T10:00:00Z");
+    git_in(dir.path(), &["tag", "--no-sign", "release-20260410.1"]);
+    assert_eq!(
+        run_target(dir.path(), "release-20260410.1").unwrap(),
+        "20260410.2"
+    );
+
+    let err = run_target(dir.path(), "20260410.2-dirty.abc1234").unwrap_err();
+    assert!(matches!(err, Error::RevisionNotFound(_)));
+}
+
 #[test]
 fn not_traceable_unrelated_history() {
     let dir = new_repo();
@@ -970,6 +1427,35 @@ fn bare_repository_explicit_revision() {
 }
 
 #[test]
+fn worktree_of_bare_repository_checks_workspace() {
+    let src = new_repo();
+    commit_at(src.path(), "2026-04-10T12:00:00Z");
+    let bare_parent = bare_clone_of(src.path());
+    let worktree = bare_parent.path().join("wt");
+    git_in(
+        &bare_parent.path().join("repo.git"),
+        &["worktree", "add", worktree.to_str().unwrap(), "main"],
+    );
+    let run_in_worktree = |dirty_suffix| {
+        run(&Options {
+            dir: &worktree,
+            branch: Some("main"),
+            dirty_suffix,
+            include_dirty_hash: false,
+            ..Options::default()
+        })
+    };
+
+    assert_eq!(run_in_worktree(None).unwrap(), "20260410.1");
+    std::fs::write(worktree.join("untracked.txt"), "x").unwrap();
+    assert!(matches!(
+        run_in_worktree(None).unwrap_err(),
+        Error::DirtyWorkspace
+    ));
+    assert_eq!(run_in_worktree(Some("-dirty")).unwrap(), "20260410.1-dirty");
+}
+
+#[test]
 fn bare_repository_reverse_lookup() {
     let src = new_repo();
     let hash = commit_at(src.path(), "2026-04-10T12:00:00Z");
@@ -984,6 +1470,146 @@ fn bare_repository_reverse_lookup() {
     })
     .unwrap();
     assert_eq!(result, hash);
+}
+
+#[test]
+fn reverse_requires_exact_version_and_prefix() {
+    let dir = new_repo();
+    let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let opts = Options {
+        dir: dir.path(),
+        branch: Some("main"),
+        ..Options::default()
+    };
+    for target in [
+        "",
+        "garbage\n20260410.1",
+        "20260410.1rc1",
+        "20260410.1-dirty.abcdef0",
+        "v0.20260410.1",
+    ] {
+        assert!(
+            matches!(
+                run(&Options {
+                    target: Some(target),
+                    ..opts
+                }),
+                Err(Error::RevisionNotFound(_))
+            ),
+            "{target:?}"
+        );
+    }
+    // A prefix may itself look like a version or contain slashes.
+    for prefix in ["v0.", "20200101.5/", "release/"] {
+        let target = format!("{prefix}20260410.1");
+        assert_eq!(
+            run(&Options {
+                target: Some(&target),
+                prefix,
+                ..opts
+            })
+            .unwrap(),
+            hash
+        );
+    }
+}
+
+#[test]
+fn short_rejects_version_like_revision() {
+    let dir = new_repo();
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    git_in(dir.path(), &["tag", "--no-sign", "20260410.1rc1"]);
+    let opts = Options {
+        dir: dir.path(),
+        target: Some("20260410.1rc1"),
+        branch: Some("main"),
+        ..Options::default()
+    };
+    assert_eq!(run(&opts).unwrap(), "20260410.1");
+    let err = run(&Options {
+        short: true,
+        ..opts
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::ShortRequiresReverse));
+}
+
+#[test]
+fn packed_repository_round_trip() {
+    let dir = new_repo();
+    std::fs::write(dir.path().join("file"), "content").unwrap();
+    git_in(dir.path(), &["add", "file"]);
+    commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let hash = commit_at(dir.path(), "2026-04-10T13:00:00Z");
+    git_in(dir.path(), &["repack", "-ad"]);
+    git_in(dir.path(), &["prune-packed"]);
+    git_in(dir.path(), &["pack-refs", "--all"]);
+    assert!(
+        !dir.path()
+            .join(".git/objects")
+            .join(&hash[..2])
+            .join(&hash[2..])
+            .exists()
+    );
+
+    let opts = Options {
+        dir: dir.path(),
+        branch: Some("main"),
+        ..Options::default()
+    };
+    assert_eq!(run(&opts).unwrap(), "20260410.2");
+    assert_eq!(
+        run(&Options {
+            target: Some("20260410.2"),
+            ..opts
+        })
+        .unwrap(),
+        hash
+    );
+}
+
+#[test]
+fn linked_worktree_round_trip_and_dirty() {
+    let dir = new_repo();
+    std::fs::write(dir.path().join("file"), "content").unwrap();
+    git_in(dir.path(), &["add", "file"]);
+    let hash = commit_at(dir.path(), "2026-04-10T12:00:00Z");
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    git_in(
+        dir.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let opts = Options {
+        dir: &linked,
+        branch: Some("main"),
+        ..Options::default()
+    };
+    assert_eq!(run(&opts).unwrap(), "20260410.1");
+    assert_eq!(
+        run(&Options {
+            target: Some("20260410.1"),
+            ..opts
+        })
+        .unwrap(),
+        hash
+    );
+    std::fs::write(linked.join("file"), "changed").unwrap();
+    assert!(matches!(run(&opts), Err(Error::DirtyWorkspace)));
+    assert_eq!(
+        run(&Options {
+            dirty_suffix: Some("-dirty"),
+            ..opts
+        })
+        .unwrap(),
+        format!("20260410.1-dirty.{}", &hash[..7])
+    );
 }
 
 // --- Incomplete history: graft, replace, shallow, partial clone ---

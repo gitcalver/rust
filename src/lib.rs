@@ -26,8 +26,26 @@ pub enum Error {
     #[error("not a git repository")]
     NotARepository,
 
+    #[error("unsupported object format {0}: only SHA-1 repositories are supported")]
+    UnsupportedObjectFormat(String),
+
+    #[error("--prefix must not contain a newline")]
+    InvalidPrefix,
+
+    #[error("--short is only valid in reverse lookup mode")]
+    ShortRequiresReverse,
+
     #[error("not a gitcalver version or git revision: {0}")]
     RevisionNotFound(String),
+
+    #[error("version {version} is missing required prefix \"{prefix}\"")]
+    MissingPrefix { version: String, prefix: String },
+
+    #[error("invalid date in version: {0}")]
+    InvalidVersionDate(String),
+
+    #[error("invalid count in version: {0}")]
+    InvalidVersionCount(String),
 
     #[error("version not found: {0}")]
     VersionNotFound(String),
@@ -35,7 +53,7 @@ pub enum Error {
     #[error("local history cannot prove the result: {0}")]
     IncompleteHistory(String),
 
-    #[error("{0}")]
+    #[error("{}", error_chain(.0.as_ref()))]
     Git(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -67,17 +85,26 @@ impl Default for Options<'_> {
 
 /// Compute a gitcalver version string or resolve a version to a commit.
 ///
-/// If `target` parses as a gitcalver version (e.g., `20260412.1`), reverse
-/// mode is used regardless of whether the string also matches a git ref.
+/// A `target` of `Some("")` is an explicit empty target and is an error, not
+/// the same as `None` (HEAD).
+///
+/// After removing the exact configured prefix, a `target` with the complete
+/// shape `YYYYMMDD.N` selects reverse mode regardless of whether the string
+/// also matches a git ref, and must then carry that prefix and a valid date.
 ///
 /// Version dates are always UTC, regardless of the committer's timezone offset.
 ///
 /// # Errors
 ///
 /// Returns `Error` if the directory is not a git repository, the workspace is
-/// dirty (unless allowed), the target is not on the default branch, or commit
-/// history is malformed or locally incomplete.
+/// dirty (unless allowed), the target is not on the default branch, the
+/// prefix, target, or flag combination is invalid, or commit history is
+/// malformed or locally incomplete.
 pub fn run(opts: &Options<'_>) -> Result<String, Error> {
+    if opts.prefix.contains('\n') {
+        return Err(Error::InvalidPrefix);
+    }
+
     let repo = open_repo(opts.dir)?;
 
     if graft_file_path(&repo).is_file() {
@@ -88,7 +115,7 @@ pub fn run(opts: &Options<'_>) -> Result<String, Error> {
     }
 
     if let Some(target) = opts.target
-        && let Some((date_str, n)) = parse_version(target)
+        && let Some((date_str, n)) = reverse_input(target, opts.prefix)?
     {
         return reverse(&repo, opts, date_str, n);
     }
@@ -130,7 +157,28 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
         trust_map,
     )
     .map(|repo| repo.to_thread_local())
-    .map_err(|_| Error::NotARepository)
+    .map_err(|e| {
+        use gix::discover::{Error as Discover, upwards::Error as Upwards};
+        match e {
+            // With only the `sha1` feature built, gix rejects any other
+            // `extensions.objectFormat` as an invalid config value.
+            Discover::Open(gix::open::Error::Config(gix::config::Error::ConfigTypedString(
+                gix::config::key::GenericErrorWithValue {
+                    key,
+                    value: Some(value),
+                    ..
+                },
+            ))) if key == "extensions.objectFormat" => {
+                Error::UnsupportedObjectFormat(value.to_string())
+            }
+            Discover::Discover(
+                Upwards::NoGitRepository { .. }
+                | Upwards::NoGitRepositoryWithinCeiling { .. }
+                | Upwards::NoGitRepositoryWithinFs { .. },
+            ) => Error::NotARepository,
+            other => git_err(other),
+        }
+    })
 }
 
 fn graft_file_path(repo: &gix::Repository) -> std::path::PathBuf {
@@ -138,17 +186,15 @@ fn graft_file_path(repo: &gix::Repository) -> std::path::PathBuf {
 }
 
 fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> {
+    if opts.short {
+        return Err(Error::ShortRequiresReverse);
+    }
+
     let is_head = opts.target.is_none();
-
-    let target_id = match opts.target {
-        None => repo.head_id().map_err(|_| Error::EmptyRepository)?.detach(),
-        Some(rev) => repo
-            .rev_parse_single(rev)
-            .map_err(|_| Error::RevisionNotFound(rev.to_owned()))?
-            .detach(),
-    };
-
     let subject = opts.target.unwrap_or("HEAD");
+
+    let target_id = resolve_target(repo, subject)?;
+
     let remote = opts.remote.unwrap_or("origin");
     let branch_name = detect_branch_name(repo, opts.branch, remote)?;
     let branch_tip = resolve_branch_tip(repo, &branch_name, remote)?;
@@ -160,7 +206,7 @@ fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> 
         Anchor::OffChain(anchor_id) => (anchor_id, true),
     };
 
-    let workspace_dirty = if is_head && !repo.is_bare() {
+    let workspace_dirty = if is_head && repo.workdir().is_some() {
         check_dirty(repo)?
     } else {
         false
@@ -194,6 +240,71 @@ fn forward(repo: &gix::Repository, opts: &Options<'_>) -> Result<String, Error> 
         opts.dirty_suffix.unwrap_or(""),
         &hash,
     ))
+}
+
+/// `HEAD` is resolved by reading refs only, never an object: an unborn `HEAD`
+/// is `EmptyRepository`, while a `HEAD` whose commit is absent locally is
+/// incomplete history. gix's revision parser peels symbolic refs through the
+/// object store and reports a missing target as a malformed spec, so a name it
+/// rejects is read as a full-length object ID or as a ref. Either is
+/// well-formed whether or not its object is present, and goes on to be peeled,
+/// which reports an absent object as incomplete history.
+fn resolve_target(repo: &gix::Repository, subject: &str) -> Result<ObjectId, Error> {
+    let id = if subject == "HEAD" {
+        head_id(repo)?
+    } else {
+        match repo.rev_parse_single(subject) {
+            Ok(id) => id.detach(),
+            Err(_) => ObjectId::from_hex(subject.as_bytes())
+                .ok()
+                .or_else(|| try_resolve_ref(repo, subject))
+                .ok_or_else(|| Error::RevisionNotFound(subject.to_owned()))?,
+        }
+    };
+    peel_to_commit(repo, id, subject)
+}
+
+/// The object `HEAD` names. gix's `Head::id` stops at the first symbolic ref, so
+/// a branch that is itself an alias has to be followed here.
+fn head_id(repo: &gix::Repository) -> Result<ObjectId, Error> {
+    use gix::head::Kind;
+    use gix::prelude::ReferenceExt as _;
+
+    match repo.head().map_err(git_err)?.kind {
+        Kind::Unborn(_) => Err(Error::EmptyRepository),
+        Kind::Detached { target, peeled } => Ok(peeled.unwrap_or(target)),
+        Kind::Symbolic(referent) => {
+            follow_to_id(referent.attach(repo)).ok_or(Error::EmptyRepository)
+        }
+    }
+}
+
+/// A tree or blob, even behind tags, is not a revision this tool can version.
+/// gix reads loose objects without checking their hashes, so a corrupt store
+/// can hold a tag chain that loops; a tag cycle is not a revision either.
+fn peel_to_commit(
+    repo: &gix::Repository,
+    mut id: ObjectId,
+    subject: &str,
+) -> Result<ObjectId, Error> {
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(id) {
+            return Err(Error::RevisionNotFound(subject.to_owned()));
+        }
+        let object = repo.try_find_object(id).map_err(git_err)?.ok_or_else(|| {
+            Error::IncompleteHistory(format!("{subject} is missing from local history"))
+        })?;
+        match object.kind {
+            gix::object::Kind::Commit => return Ok(id),
+            gix::object::Kind::Tag => {
+                id = object.to_tag_ref_iter().target_id().map_err(git_err)?;
+            }
+            gix::object::Kind::Tree | gix::object::Kind::Blob => {
+                return Err(Error::RevisionNotFound(subject.to_owned()));
+            }
+        }
+    }
 }
 
 fn reverse(
@@ -537,10 +648,13 @@ fn resolve_branch_tip(repo: &gix::Repository, name: &str, remote: &str) -> Resul
 /// and so would misreport a resolvable ref as unresolvable if that object
 /// happened to be locally missing.
 fn try_resolve_ref(repo: &gix::Repository, ref_name: &str) -> Option<ObjectId> {
-    repo.find_reference(ref_name)
-        .ok()?
-        .try_id()
-        .map(gix::Id::detach)
+    follow_to_id(repo.find_reference(ref_name).ok()?)
+}
+
+/// `None` when a link in the chain dangles, or the chain is cyclic or longer
+/// than git itself follows.
+fn follow_to_id(mut reference: gix::Reference<'_>) -> Option<ObjectId> {
+    reference.follow_to_object().ok().map(gix::Id::detach)
 }
 
 /// Check if workspace is dirty, including untracked non-gitignored files.
@@ -600,6 +714,19 @@ fn git_err(e: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Git(Box::new(e))
 }
 
+/// An error and its sources as `outer: inner`; gix reports the actionable
+/// reason, such as a bad config line, only in a source.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 fn format_version(
     prefix: &str,
     date: &str,
@@ -619,47 +746,58 @@ fn format_version(
     version
 }
 
-#[must_use]
-pub fn parse_version(s: &str) -> Option<(&str, usize)> {
-    (0..s.len()).find_map(|start| try_parse_version_at(s, start))
+/// Classify `target` as a reverse-lookup input, returning its date and count.
+///
+/// Only a complete `YYYYMMDD.N` left after removing the exact `prefix` enters
+/// reverse mode; trailing or leading text means it is a revision instead. Once
+/// a complete shape is seen the input is committed to reverse mode even if it
+/// is unusable, so a tag named like a version can never shadow the lookup.
+fn reverse_input<'a>(target: &'a str, prefix: &str) -> Result<Option<(&'a str, usize)>, Error> {
+    let stripped = target.strip_prefix(prefix);
+    let Some((date, count)) = split_version(stripped.unwrap_or(target)) else {
+        return Ok(None);
+    };
+
+    if stripped.is_none() {
+        return Err(Error::MissingPrefix {
+            version: target.to_owned(),
+            prefix: prefix.to_owned(),
+        });
+    }
+    if !is_gregorian_date(date) {
+        return Err(Error::InvalidVersionDate(target.to_owned()));
+    }
+    let n = count
+        .parse()
+        .map_err(|_| Error::InvalidVersionCount(target.to_owned()))?;
+    Ok(Some((date, n)))
 }
 
-fn try_parse_version_at(s: &str, start: usize) -> Option<(&str, usize)> {
-    let bytes = s.as_bytes();
-    // Need 8 date digits + '.' + at least one count digit.
-    if start + 10 > bytes.len() {
-        return None;
-    }
-
-    // Operate on bytes for the fixed-width date so an arbitrary `start` (which
-    // may land inside a multi-byte UTF-8 char) never triggers a slicing panic.
-    // Requiring all eight to be ASCII digits also guarantees `start..start + 8`
-    // are char boundaries, making the following string slices safe.
-    if !bytes[start..start + 8].iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let date_part = &s[start..start + 8];
-    if !looks_like_date(date_part) || bytes[start + 8] != b'.' {
-        return None;
-    }
-
-    let n_str = s[start + 9..].split(|c: char| !c.is_ascii_digit()).next()?;
-    if n_str.is_empty() || (n_str.len() > 1 && n_str.starts_with('0')) {
-        return None;
-    }
-    let n: usize = n_str.parse().ok()?;
-    if n == 0 {
-        return None;
-    }
-
-    Some((date_part, n))
+/// Split exactly `YYYYMMDD.N` (ASCII digits, no leading zero in `N`) without
+/// validating the date.
+fn split_version(s: &str) -> Option<(&str, &str)> {
+    let (date, count) = s.split_once('.')?;
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    (date.len() == 8
+        && all_digits(date)
+        && !count.is_empty()
+        && all_digits(count)
+        && !count.starts_with('0'))
+    .then_some((date, count))
 }
 
-fn looks_like_date(s: &str) -> bool {
-    let year: u32 = s[0..4].parse().unwrap_or(0);
-    let month: u32 = s[4..6].parse().unwrap_or(0);
-    let day: u32 = s[6..8].parse().unwrap_or(0);
-    year >= 1970 && (1..=12).contains(&month) && (1..=31).contains(&day)
+/// `date` must be eight ASCII digits.
+fn is_gregorian_date(date: &str) -> bool {
+    let year = date[..4].parse::<i32>();
+    let month = date[4..6]
+        .parse::<u8>()
+        .ok()
+        .and_then(|m| time::Month::try_from(m).ok());
+    let day = date[6..].parse::<u8>();
+    matches!(
+        (year, month, day),
+        (Ok(y), Some(m), Ok(d)) if y >= 1 && time::Date::from_calendar_date(y, m, d).is_ok()
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
