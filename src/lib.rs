@@ -168,30 +168,8 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
     let repo = gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
         dir, options, trust_map,
     )
-    .map(|repo| repo.to_thread_local())
-    .map_err(|e| {
-        use gix::discover::{Error as Discover, upwards::Error as Upwards};
-        match e {
-            // gix reports an object format it was not built for as an
-            // invalid `extensions.objectFormat` config value.
-            Discover::Open(gix::open::Error::Config(gix::config::Error::ConfigTypedString(
-                gix::config::key::GenericErrorWithValue {
-                    key,
-                    value: Some(value),
-                    ..
-                },
-            ))) if key == "extensions.objectFormat" => {
-                Error::UnsupportedObjectFormat(value.to_string())
-            }
-            Discover::Open(gix::open::Error::NotARepository { .. })
-            | Discover::Discover(
-                Upwards::NoGitRepository { .. }
-                | Upwards::NoGitRepositoryWithinCeiling { .. }
-                | Upwards::NoGitRepositoryWithinFs { .. },
-            ) => Error::NotARepository,
-            other => git_err(other),
-        }
-    })?;
+    .map_err(open_error)?
+    .to_thread_local();
     // A repository named by `GIT_DIR` involved no discovery. An empty value
     // still counts: git fails on it rather than discovering.
     if std::env::var_os("GIT_DIR").is_none() {
@@ -199,6 +177,47 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
         check_discovery(dir, &repo, ceilings.as_deref())?;
     }
     Ok(repo)
+}
+
+/// gix erases its error types, so each case is recognised by a concrete cause
+/// or by the metadata and text of a diagnostic.
+fn open_error(error: gix::Error) -> Error {
+    use gix::discover::upwards::Error as Upwards;
+    use gix::error::{Class, Message, MetadataValue};
+
+    // gix reports an unknown `extensions.objectFormat` as a diagnostic carrying
+    // that key and the offending value.
+    for values in error.metadata() {
+        if values.get("key") == Some(&MetadataValue::from("extensions.objectFormat"))
+            && let Some(MetadataValue::Bytes(value)) = values.get("input")
+        {
+            return Error::UnsupportedObjectFormat(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    // A path that is not a repository, such as one named by `GIT_DIR`, has no
+    // error type of its own: gix raises a not-found diagnostic with this text.
+    let not_a_repository = error
+        .iter_errors()
+        .filter_map(|cause| cause.downcast_ref::<Message>())
+        .any(|message| {
+            message.class == Some(Class::NotFound)
+                && message
+                    .message
+                    .ends_with("does not appear to be a git repository")
+        });
+    if not_a_repository
+        || matches!(
+            error.downcast_any_ref::<Upwards>(),
+            Some(
+                Upwards::NoGitRepository { .. }
+                    | Upwards::NoGitRepositoryWithinCeiling { .. }
+                    | Upwards::NoGitRepositoryWithinFs { .. }
+            )
+        )
+    {
+        return Error::NotARepository;
+    }
+    git_err(error)
 }
 
 /// Make discovery agree with git where gix does not. gix steps over a `.git`
@@ -758,7 +777,7 @@ fn check_dirty(repo: &gix::Repository) -> Result<bool, Error> {
         gix::status::tree_index::TrackRenames::Disabled,
         |_, _, _| {
             index_dirty = true;
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            Ok(std::ops::ControlFlow::Break(()))
         },
     )
     .map_err(git_err)?;
@@ -803,13 +822,21 @@ fn git_err(e: impl std::error::Error + Send + Sync + 'static) -> Error {
 }
 
 /// An error and its sources as `outer: inner`; gix reports the actionable
-/// reason, such as a bad config line, only in a source.
+/// reason, such as a bad config line, only in a source. gix keeps its
+/// classification markers, which display as a bare class name, in `source()`
+/// chains, and exposes the payload of an `io::Error` as a source although the
+/// error's own text already includes it.
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
+    let mut last = message.clone();
     let mut source = error.source();
     while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
+        let text = cause.to_string();
+        if !cause.is::<gix::error::ClassificationMarker>() && text != last {
+            message.push_str(": ");
+            message.push_str(&text);
+            last = text;
+        }
         source = cause.source();
     }
     message
