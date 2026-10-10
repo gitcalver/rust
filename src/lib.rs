@@ -131,17 +131,22 @@ pub fn run(opts: &Options<'_>) -> Result<String, Error> {
 }
 
 /// Open the repository with replacement refs disabled at the object-store
-/// level (so every subsequent lookup ignores them, with no process-global
-/// state) rather than relying on an environment variable.
+/// level, so every subsequent lookup ignores them, with no process-global
+/// state.
 ///
 /// The key must be `core.useReplaceRefs`: it is the only key gix's
 /// `replacement_objects_refs_prefix()` gate actually reads (the
-/// `gitoxide.objects.noReplace` key is defined but never consulted in gix
-/// 0.86), and an API-level override outranks both the repository's own
-/// config and the `GIT_NO_REPLACE_OBJECTS` environment mapping.
+/// `gitoxide.objects.noReplace` key is defined but never consulted), and an
+/// API-level override outranks the repository's own config.
 ///
-/// gix 0.86 inverts the gate: `replacement_objects_refs_prefix()` assigns
-/// the *enabled* value to a variable named `is_disabled`, so `true` is what
+/// gix applies environment variables after API overrides, so
+/// `GIT_NO_REPLACE_OBJECTS` and `GIT_REPLACE_REF_BASE` would outrank them;
+/// denying the `objects` environment permission stops gix reading them, as
+/// well as its cache size and allocation limit variables. git ignores
+/// replacements whenever `GIT_NO_REPLACE_OBJECTS` is set, to any value.
+///
+/// gix inverts the gate: `replacement_objects_refs_prefix()` assigns the
+/// *enabled* value to a variable named `is_disabled`, so `true` is what
 /// actually disables replacement honoring, and a repository setting
 /// `core.useReplaceRefs=false` would otherwise enable it. Overriding to
 /// `true` disables it under that inversion; the inert `replaceRefBase`
@@ -157,6 +162,8 @@ fn open_repo(dir: &std::path::Path) -> Result<gix::Repository, Error> {
     let mut trust_map = gix::sec::trust::Mapping::<gix::open::Options>::default();
     trust_map.full = trust_map.full.config_overrides(NO_REPLACE_OVERRIDES);
     trust_map.reduced = trust_map.reduced.config_overrides(NO_REPLACE_OVERRIDES);
+    trust_map.full.permissions.env.objects = gix::sec::Permission::Deny;
+    trust_map.reduced.permissions.env.objects = gix::sec::Permission::Deny;
 
     // As in git, a ceiling directory that does not contain the start directory
     // is ignored rather than an error.

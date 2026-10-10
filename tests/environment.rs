@@ -13,6 +13,10 @@ const GIT_ENVIRONMENT: [&str; 4] = [
 ];
 
 fn git(dir: &Path, args: &[&str]) {
+    git_at(dir, "2026-04-10T12:00:00Z", args);
+}
+
+fn git_at(dir: &Path, date: &str, args: &[&str]) {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -21,8 +25,8 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@test.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@test.com")
-        .env("GIT_AUTHOR_DATE", "2026-04-10T12:00:00Z")
-        .env("GIT_COMMITTER_DATE", "2026-04-10T12:00:00Z");
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date);
     for name in GIT_ENVIRONMENT {
         command.env_remove(name);
     }
@@ -122,6 +126,54 @@ fn git_dir_that_is_not_a_repository_is_an_error() {
     assert_not_a_repository(&gitcalver(&here, &[("GIT_DIR", &missing)]));
     // An empty value is set, not absent, so there is no fallback to discovery.
     assert_not_a_repository(&gitcalver(&here, &[("GIT_DIR", Path::new(""))]));
+}
+
+#[test]
+fn replacement_refs_are_ignored_whatever_the_environment_says() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    repo_with_commits(&repo, 0);
+    for (date, message) in [
+        ("2026-04-09T12:00:00Z", "first"),
+        ("2026-04-10T12:00:00Z", "second"),
+    ] {
+        git_at(
+            &repo,
+            date,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+    }
+    git(&repo, &["replace", "HEAD", "HEAD~1"]);
+    let git_dir = repo.join(".git");
+
+    assert_eq!(stdout(&gitcalver(&repo, &[])), "20260410.1");
+    // git itself ignores replacements whenever GIT_NO_REPLACE_OBJECTS is set,
+    // to any value; gix reads the falsy ones as a request to honour them.
+    for no_replace in ["false", "0", ""] {
+        let environment = [
+            ("GIT_NO_REPLACE_OBJECTS", Path::new(no_replace)),
+            ("GIT_REPLACE_REF_BASE", Path::new("refs/replace/")),
+        ];
+        assert_eq!(
+            stdout(&gitcalver(&repo, &environment)),
+            "20260410.1",
+            "GIT_NO_REPLACE_OBJECTS={no_replace:?}"
+        );
+        let mut with_git_dir = environment.to_vec();
+        with_git_dir.push(("GIT_DIR", &git_dir));
+        assert_eq!(
+            stdout(&gitcalver(&repo, &with_git_dir)),
+            "20260410.1",
+            "GIT_NO_REPLACE_OBJECTS={no_replace:?} with GIT_DIR"
+        );
+    }
 }
 
 #[test]
