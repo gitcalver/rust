@@ -82,7 +82,7 @@ fn stdout(output: &Output) -> String {
 fn assert_not_a_repository(output: &Output) {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a git repository"), "{stderr}");
+    assert_eq!(stderr.trim_end(), "gitcalver: not a git repository");
 }
 
 #[test]
@@ -133,6 +133,11 @@ fn ceiling_directories_are_read_from_the_environment() {
     std::fs::create_dir_all(&nested).unwrap();
 
     assert_not_a_repository(&gitcalver(&nested, &[("GIT_CEILING_DIRECTORIES", &repo)]));
+    // A ceiling between the start directory and the repository ends the search
+    // before it finds one.
+    let deeper = nested.join("deeper");
+    std::fs::create_dir_all(&deeper).unwrap();
+    assert_not_a_repository(&gitcalver(&deeper, &[("GIT_CEILING_DIRECTORIES", &nested)]));
     let above = repo.parent().unwrap();
     assert_eq!(
         stdout(&gitcalver(&nested, &[("GIT_CEILING_DIRECTORIES", above)])),

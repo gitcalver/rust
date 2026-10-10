@@ -1041,6 +1041,20 @@ fn unknown_object_format_is_reported_as_unsupported() {
 }
 
 #[test]
+fn config_error_carrying_input_is_not_an_object_format_error() {
+    let dir = new_repo();
+    git_in(dir.path(), &["config", "core.worktree", ""]);
+
+    let err = run(&Options {
+        dir: dir.path(),
+        ..Options::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, Error::Git(_)), "{err}");
+    assert!(err.to_string().contains("core.worktree"), "{err}");
+}
+
+#[test]
 fn sha256_repository_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     git_in(
@@ -1238,6 +1252,68 @@ fn git_error_message_includes_its_sources() {
 
     let err = git_err(Outer(std::io::Error::other("inner")));
     assert_eq!(err.to_string(), "outer: inner");
+}
+
+#[test]
+fn git_error_message_omits_gix_classification_markers() {
+    let dir = new_repo();
+    let config = dir.path().join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[core\n  bad");
+    std::fs::write(&config, text).unwrap();
+
+    let err = run(&Options {
+        dir: dir.path(),
+        ..Options::default()
+    })
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(matches!(err, Error::Git(_)), "{message}");
+    assert!(message.contains("configuration"), "{message}");
+    assert!(!message.ends_with("Validation"), "{message}");
+}
+
+#[test]
+fn git_error_message_does_not_repeat_an_io_payload() {
+    let dir = new_repo();
+    std::fs::create_dir_all(dir.path().join(".git/objects/info/alternates")).unwrap();
+
+    let err = run(&Options {
+        dir: dir.path(),
+        ..Options::default()
+    })
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(matches!(err, Error::Git(_)), "{message}");
+    assert_eq!(
+        message.matches("Could not read alternates").count(),
+        1,
+        "{message}"
+    );
+}
+
+#[test]
+fn only_the_object_format_key_selects_unsupported_object_format() {
+    use gix::error::{ErrorExt, validation};
+
+    let diagnostic = |key: &'static str| {
+        validation("Invalid configuration value")
+            .with("key", key)
+            .with_input(b"sha512".as_slice())
+            .raise()
+    };
+    assert!(matches!(
+        open_error(diagnostic("extensions.objectFormat")),
+        Error::UnsupportedObjectFormat(name) if name == "sha512"
+    ));
+    assert!(matches!(open_error(diagnostic("core.eol")), Error::Git(_)));
+}
+
+#[test]
+fn opening_a_directory_that_is_not_a_repository_is_not_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = open_error(gix::ThreadSafeRepository::open(dir.path()).unwrap_err());
+    assert!(matches!(err, Error::NotARepository), "{err}");
 }
 
 #[test]
