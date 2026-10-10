@@ -772,39 +772,19 @@ fn follow_to_id(mut reference: gix::Reference<'_>) -> Option<ObjectId> {
 }
 
 /// Check if workspace is dirty, including untracked non-gitignored files.
-/// `repo.is_dirty()` excludes untracked files; the spec requires them.
+/// `repo.is_dirty()` excludes untracked files; the spec requires them. The
+/// whole work tree counts whatever the current directory is: a status limited
+/// to that directory would miss staged changes elsewhere.
 fn check_dirty(repo: &gix::Repository) -> Result<bool, Error> {
-    let head_tree_id = repo.head_tree_id().map_err(git_err)?;
-    let index = repo.index_or_empty().map_err(git_err)?;
-    let mut index_dirty = false;
-    repo.tree_index_status(
-        &head_tree_id,
-        &index,
-        None,
-        gix::status::tree_index::TrackRenames::Disabled,
-        |_, _, _| {
-            index_dirty = true;
-            Ok(std::ops::ControlFlow::Break(()))
-        },
-    )
-    .map_err(git_err)?;
-    if index_dirty {
-        return Ok(true);
-    }
-
-    if let Some(entry) = repo
+    let mut changes = repo
         .status(gix::progress::Discard)
         .map_err(git_err)?
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
         .index_worktree_rewrites(None)
         .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: true })
-        .into_index_worktree_iter(Vec::new())
-        .map_err(git_err)?
-        .next()
-    {
-        entry.map_err(git_err)?;
-        return Ok(true);
-    }
-    Ok(false)
+        .into_iter(Vec::new())
+        .map_err(git_err)?;
+    Ok(changes.next().transpose().map_err(git_err)?.is_some())
 }
 
 /// The dirty hash is always the literal first seven characters of the full

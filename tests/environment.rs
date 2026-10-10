@@ -1,6 +1,7 @@
-//! Repository discovery driven by git's environment variables. They are set on
-//! a child process because the crate forbids the `unsafe` needed to set them in
-//! this one.
+//! Behaviour that depends on git's environment variables or the working
+//! directory. Both are set on a child process: the crate forbids the `unsafe`
+//! needed to set environment variables in this one, and a shared working
+//! directory would race between tests.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -67,6 +68,16 @@ fn gitcalver(dir: &Path, environment: &[(&str, &Path)]) -> Output {
     }
     for (name, value) in environment {
         command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+/// Run gitcalver on the workspace, which must be clean for it to succeed.
+fn gitcalver_workspace(dir: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gitcalver"));
+    command.args(["--branch", "main"]).current_dir(dir);
+    for name in GIT_ENVIRONMENT {
+        command.env_remove(name);
     }
     command.output().unwrap()
 }
@@ -203,4 +214,38 @@ fn ceiling_directories_are_read_from_the_environment() {
         )),
         "20260410.1"
     );
+}
+
+#[test]
+fn staged_change_outside_the_current_directory_is_dirty() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    repo_with_commits(&repo, 0);
+    for dir in ["a", "b"] {
+        std::fs::create_dir(repo.join(dir)).unwrap();
+        std::fs::write(repo.join(dir).join("file"), "1").unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "test"],
+    );
+    let directories = [repo.clone(), repo.join("a"), repo.join("b")];
+
+    for dir in &directories {
+        assert_eq!(stdout(&gitcalver_workspace(dir)), "20260410.1");
+    }
+    std::fs::write(repo.join("a/file"), "2").unwrap();
+    git(&repo, &["add", "a/file"]);
+    for dir in &directories {
+        let output = gitcalver_workspace(dir);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}: {}{}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
