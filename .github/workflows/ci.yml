@@ -55,7 +55,7 @@ jobs:
       - run: make acceptance CONFORMANCE_DIR=conformance-sh
         env:
           GIT_DEFAULT_HASH: ${{ matrix.object-format }}
-    name: acceptance
+    name: acceptance (${{ matrix.object-format }})
 
   coverage:
     runs-on: ubuntu-26.04

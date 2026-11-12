@@ -32,4 +32,4 @@ jobs:
     needs: verify
   verify:
     name: Verify release
-    uses: $/.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] Reusable CI resolves to the caller's commit.

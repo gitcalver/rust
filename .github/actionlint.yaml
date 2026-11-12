@@ -3,8 +3,3 @@ self-hosted-runner:
     - ubuntu-26.04
     - ubuntu-26.04-arm
     - xcode-27
-paths:
-  .github/workflows/publish.yml:
-    ignore:
-      # actionlint does not recognize GitHub self-repository workflow references.
-      - ^reusable workflow call "\$/\.github/workflows/ci\.yml" at "uses" is not following the format
