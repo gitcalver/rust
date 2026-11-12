@@ -7,7 +7,7 @@ build:
 test:
 	cargo test
 
-lint:
+lint: actions-lock-verify-local
 	cargo fmt --check
 	cargo clippy --all-targets
 
@@ -40,3 +40,17 @@ publish publish-dry-run:
 	CARGO_TARGET_DIR="$$src/target" cargo publish $(if $(findstring dry,$@),--dry-run,)
 
 .PHONY: build test lint fmt acceptance coverage publish publish-dry-run
+
+.PHONY: actions-lock-install actions-lock actions-lock-verify-local actions-lock-verify
+
+actions-lock-install:
+	gh extension install github/gh-actions-lock --pin v0.4.1 --force
+
+actions-lock:
+	gh actions-lock --no-interactive
+
+actions-lock-verify-local:
+	gh actions-lock --verify-local
+
+actions-lock-verify:
+	gh actions-lock --verify

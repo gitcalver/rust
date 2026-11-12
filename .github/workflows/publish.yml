@@ -1,9 +1,6 @@
 name: Publish
 
 on:
-  # crates.io Trusted Publishing rejects the `workflow_run` trigger, so we
-  # cannot gate this workflow on CI completion. Use branch protection on
-  # `main` to ensure CI passes before a commit reaches this trigger.
   push:
     branches: [main]
 
@@ -20,13 +17,19 @@ jobs:
     environment: release
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Authenticates the release to the package registry through OIDC.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+          persist-credentials: false
+      - uses: rust-lang/crates-io-auth-action@v1.0.6
         id: auth
       - run: make publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+    name: publish
+    needs: verify
+  verify:
+    name: Verify release
+    uses: $/.github/workflows/ci.yml

@@ -6,22 +6,31 @@ on:
   # don't cancel each other—accepted in exchange for branch-level coverage
   # without requiring an open PR.
   push:
+    branches:
+      - "**"
   pull_request:
 
+  workflow_call: null
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: make actions-lock-install
+        env:
+          GH_TOKEN: ${{ github.token }}
       - run: make lint
       - run: make test
+    name: test
 
   acceptance:
     runs-on: ubuntu-26.04
@@ -29,12 +38,15 @@ jobs:
       matrix:
         object-format: [sha1, sha256]
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
         with:
           repository: gitcalver/sh
           ref: 857287da052d1437703ead1f7d2adc76a95451ba
           path: conformance-sh
+          persist-credentials: false
       # GIT_DEFAULT_HASH is set per step: at job level it would also make
       # actions/checkout initialise a SHA-256 repository it cannot fetch into.
       - run: make test
@@ -43,11 +55,15 @@ jobs:
       - run: make acceptance CONFORMANCE_DIR=conformance-sh
         env:
           GIT_DEFAULT_HASH: ${{ matrix.object-format }}
+    name: acceptance
 
   coverage:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal --component llvm-tools-preview
       - run: cargo install cargo-llvm-cov --locked
       - run: make coverage
+    name: coverage
